@@ -16,6 +16,13 @@ class Portfolio {
         this.isInitialized = false;
         // Lightweight mutex to serialize trade executions and avoid race conditions
         this._tradeLock = false;
+
+        // SIMPLE MODE: cuando está activado, el portfolio permite bypass de comprobaciones
+        // de fondos para facilitar simulaciones donde "se reinvierte TODO" sin restricciones.
+        this.simpleMode = (process.env.BOT_SIMPLE_MODE === '1' || process.env.BOT_SIMPLE_MODE === 'true' || process.env.BOT_SIMPLE_MODE === 'on');
+        if (this.simpleMode) {
+            console.warn('⚠️ Portfolio iniciado en SIMPLE MODE — se permitirán operaciones aun sin fondos reales (modo simulación).');
+        }
     }
 
     // Internal helper to run a function with a simple mutex
@@ -250,11 +257,16 @@ class Portfolio {
         const totalCost = trade.usdAmount + trade.fee;
         
         // Verificar si tenemos suficiente balance
-        if (this.balance < totalCost) {
+        if (this.balance < totalCost && !this.simpleMode) {
             const message = `Balance insuficiente para compra: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
             console.log('❌ ' + message);
             await this.db.addLog('warning', message, 'portfolio');
             return false;
+        } else if (this.balance < totalCost && this.simpleMode) {
+            const message = `⚠️ SIMPLE MODE: Balance insuficiente pero permitiendo compra (balance=$${this.balance.toFixed(2)}, cost=$${totalCost.toFixed(2)})`;
+            console.warn(message);
+            try { await this.db.addLog('warning', message, 'portfolio'); } catch(e){}
+            // En modo simple dejamos que la operación deje balance negativo para simular reinversión inmediata
         }
 
         // Ejecutar la compra
@@ -310,11 +322,16 @@ class Portfolio {
         }
 
         // Verificar si tenemos suficiente BTC (venta normal para cerrar long)
-        if (this.btcAmount < trade.amount) {
+        if (this.btcAmount < trade.amount && !this.simpleMode) {
             const message = `BTC insuficiente para venta: ${this.btcAmount.toFixed(8)} < ${trade.amount.toFixed(8)}`;
             console.log('❌ ' + message);
             await this.db.addLog('warning', message, 'portfolio');
             return false;
+        } else if (this.btcAmount < trade.amount && this.simpleMode) {
+            const message = `⚠️ SIMPLE MODE: BTC insuficiente pero permitiendo venta (btc=${this.btcAmount.toFixed(8)}, requested=${trade.amount.toFixed(8)})`;
+            console.warn(message);
+            try { await this.db.addLog('warning', message, 'portfolio'); } catch(e){}
+            // En modo simple permitimos que btcAmount quede negativo para simular posiciones sintéticas
         }
 
         // Ejecutar la venta
@@ -447,15 +464,17 @@ class Portfolio {
 
         // Enforce: clamp requested usdAmount to available balance (portfolio-side enforcement)
         try {
-            const available = Number(this.balance || 0);
-            if (trade.usdAmount + feeAmount > available) {
-                const prev = trade.usdAmount + feeAmount;
-                // reduce usdAmount so totalCost == available (or slightly less to avoid zero)
-                trade.usdAmount = Math.max(0, available - feeAmount);
-                trade.amount = trade.price > 0 ? Number(trade.usdAmount) / Number(trade.price) : 0;
-                const msg = `⚠️ Ajustado usdAmount para OPEN SHORT: antes=${prev.toFixed(2)}, ahora=${(trade.usdAmount+feeAmount).toFixed(2)} (usdAmount=${trade.usdAmount.toFixed(2)}, fee=${feeAmount.toFixed(2)})`;
-                console.log(msg);
-                try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e) {}
+            if (!trade.forceSimple) {
+                const available = Number(this.balance || 0);
+                if (trade.usdAmount + feeAmount > available) {
+                    const prev = trade.usdAmount + feeAmount;
+                    // reduce usdAmount so totalCost == available (or slightly less to avoid zero)
+                    trade.usdAmount = Math.max(0, available - feeAmount);
+                    trade.amount = trade.price > 0 ? Number(trade.usdAmount) / Number(trade.price) : 0;
+                    const msg = `⚠️ Ajustado usdAmount para OPEN SHORT: antes=${prev.toFixed(2)}, ahora=${(trade.usdAmount+feeAmount).toFixed(2)} (usdAmount=${trade.usdAmount.toFixed(2)}, fee=${feeAmount.toFixed(2)})`;
+                    console.log(msg);
+                    try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e) {}
+                }
             }
         } catch (e) {
             console.warn('⚠️ Error calculando clamp de usdAmount para short:', e && e.message ? e.message : e);
@@ -469,14 +488,17 @@ class Portfolio {
         } catch (e) {}
 
         const totalCost = trade.usdAmount + feeAmount;
-        if (this.balance < totalCost || trade.usdAmount <= 0) {
-            const msg = `Balance insuficiente o monto nulo para abrir short tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
-            console.log('❌ ' + msg);
-            await this.db.addLog('warning', msg, 'portfolio');
-            return false;
+        if (!trade.forceSimple) {
+            if (this.balance < totalCost || trade.usdAmount <= 0) {
+                const msg = `Balance insuficiente o monto nulo para abrir short tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
+                console.log('❌ ' + msg);
+                await this.db.addLog('warning', msg, 'portfolio');
+                return false;
+            }
         }
 
         // Debitar el importe usado para la apertura (se considera reservado/consumido)
+        // In forceSimple mode allow negative balance (simple behavior requested)
         this.balance -= totalCost;
         this.balance = Number(this.balance) || 0;
 
@@ -575,78 +597,80 @@ class Portfolio {
             console.log('❌ ' + message);
             console.log('⚠️ Diagnostic snapshot for insufficient-close:', diagnostic);
             try { await this.db.addLog('warning', `${message} | diagnostic=${JSON.stringify(diagnostic)}`, 'portfolio'); } catch(e) {}
-
-            // Optional auto-liquidation: if enabled, attempt to free USD by selling available long BTC
-            try {
-                const autoFlag = process.env.AUTO_LIQUIDATE_ON_SHORT_CLOSE === '1';
-                if (autoFlag) {
-                    const neededUsd = Math.max(0, cost - availableForClose);
-                    const neededBtc = exitPrice > 0 ? (neededUsd / exitPrice) : 0;
-                    if (neededBtc > 0 && (this.btcAmount || 0) >= neededBtc) {
-                        // Perform a lightweight liquidation: reduce btcAmount and add cash
-                        // Create a synthetic sell record for audit (not tied to a specific long position)
-                        const liquidUsd = Number((neededBtc * exitPrice));
-                        this.btcAmount = Number(this.btcAmount) - Number(neededBtc);
-                        this.balance = Number(this.balance) + Number(liquidUsd);
-                        // Record audit log and a synthetic trade row for traceability
-                        try {
-                            await this.db.addLog('info', `Auto-liquidación: vendiendo ${neededBtc.toFixed(8)} BTC por $${liquidUsd.toFixed(2)} para cubrir cierre SHORT ${pos.id}`, 'portfolio');
-                            const synth = {
-                                id: this.generateTradeId(),
-                                trade_id: this.generateTradeId(),
-                                type: 'SELL',
-                                amount: neededBtc,
-                                price: exitPrice,
-                                usd_amount: liquidUsd,
-                                fee: 0,
-                                timestamp: new Date(),
-                                confidence: 0,
-                                reasons: ['AUTO_LIQUIDATION_FOR_SHORT_CLOSE'],
-                                balance_after: this.balance,
-                                btc_after: this.btcAmount,
-                                status: 'completed',
-                                created_at: (new Date()).toISOString(),
-                                entry_price: 0,
-                                exit_price: exitPrice,
-                                gain_loss: null,
-                                roi: null,
-                                related_trade_id: null,
-                                position_side: 'long',
-                                position_id: null,
-                                action: 'auto_liquidation'
-                            };
-                            // Save synthetic trade directly to DB for audit history
-                            if (this.db && typeof this.db.saveTrade === 'function') {
-                                await this.db.saveTrade(synth);
-                                this.trades.unshift(synth);
+            // If running in SIMPLE MODE (test/forced behavior), allow the close anyway
+            if (this.simpleMode || trade.forceSimple) {
+                const fm = `⚠️ SIMPLE MODE / forceSimple: forzando cierre SHORT ${pos.id} aunque available=${availableForClose.toFixed(2)} < cost=${cost.toFixed(2)}`;
+                console.warn(fm);
+                try { await this.db.addLog('warning', fm, 'portfolio'); } catch(e) {}
+                // proceed with closure ignoring shortfall (balance may become negative)
+            } else {
+                // Optional auto-liquidation: if enabled, attempt to free USD by selling available long BTC
+                try {
+                    const autoFlag = process.env.AUTO_LIQUIDATE_ON_SHORT_CLOSE === '1';
+                    if (autoFlag) {
+                        const neededUsd = Math.max(0, cost - availableForClose);
+                        const neededBtc = exitPrice > 0 ? (neededUsd / exitPrice) : 0;
+                        if (neededBtc > 0 && (this.btcAmount || 0) >= neededBtc) {
+                            // Perform a lightweight liquidation: reduce btcAmount and add cash
+                            const liquidUsd = Number((neededBtc * exitPrice));
+                            this.btcAmount = Number(this.btcAmount) - Number(neededBtc);
+                            this.balance = Number(this.balance) + Number(liquidUsd);
+                            try {
+                                await this.db.addLog('info', `Auto-liquidación: vendiendo ${neededBtc.toFixed(8)} BTC por $${liquidUsd.toFixed(2)} para cubrir cierre SHORT ${pos.id}`, 'portfolio');
+                                const synth = {
+                                    id: this.generateTradeId(),
+                                    trade_id: this.generateTradeId(),
+                                    type: 'SELL',
+                                    amount: neededBtc,
+                                    price: exitPrice,
+                                    usd_amount: liquidUsd,
+                                    fee: 0,
+                                    timestamp: new Date(),
+                                    confidence: 0,
+                                    reasons: ['AUTO_LIQUIDATION_FOR_SHORT_CLOSE'],
+                                    balance_after: this.balance,
+                                    btc_after: this.btcAmount,
+                                    status: 'completed',
+                                    created_at: (new Date()).toISOString(),
+                                    entry_price: 0,
+                                    exit_price: exitPrice,
+                                    gain_loss: null,
+                                    roi: null,
+                                    related_trade_id: null,
+                                    position_side: 'long',
+                                    position_id: null,
+                                    action: 'auto_liquidation'
+                                };
+                                if (this.db && typeof this.db.saveTrade === 'function') {
+                                    await this.db.saveTrade(synth);
+                                    this.trades.unshift(synth);
+                                }
+                            } catch (e) {
+                                console.warn('⚠️ Error registrando auto-liquidación:', e && e.message ? e.message : e);
                             }
-                        } catch (e) {
-                            console.warn('⚠️ Error registrando auto-liquidación:', e && e.message ? e.message : e);
-                        }
 
-                        // Recompute availableForClose after liquidation
-                        const newEntryUsd = Number(pos.entryUsd || 0);
-                        const newAvailable = Number(this.balance || 0) + newEntryUsd;
-                        if (newAvailable >= cost) {
-                            await this.db.addLog('info', `Auto-liquidación completada, available=${newAvailable.toFixed(2)} >= cost=${cost.toFixed(2)}. Procediendo con cierre SHORT ${pos.id}`, 'portfolio');
-                            // continue with closing flow (fall through)
+                            const newEntryUsd = Number(pos.entryUsd || 0);
+                            const newAvailable = Number(this.balance || 0) + newEntryUsd;
+                            if (newAvailable >= cost) {
+                                await this.db.addLog('info', `Auto-liquidación completada, available=${newAvailable.toFixed(2)} >= cost=${cost.toFixed(2)}. Procediendo con cierre SHORT ${pos.id}`, 'portfolio');
+                            } else {
+                                const msg2 = `Auto-liquidación insuficiente: available=${newAvailable.toFixed(2)} < cost=${cost.toFixed(2)}`;
+                                console.log('❌ ' + msg2);
+                                await this.db.addLog('warning', msg2, 'portfolio');
+                                return false;
+                            }
                         } else {
-                            const msg2 = `Auto-liquidación insuficiente: available=${newAvailable.toFixed(2)} < cost=${cost.toFixed(2)}`;
-                            console.log('❌ ' + msg2);
-                            await this.db.addLog('warning', msg2, 'portfolio');
+                            await this.db.addLog('warning', `AUTO_LIQUIDATE requested but insufficient BTC to liquidate (have ${this.btcAmount || 0}, need ${neededBtc})`, 'portfolio');
                             return false;
                         }
-                    } else {
-                        await this.db.addLog('warning', `AUTO_LIQUIDATE requested but insufficient BTC to liquidate (have ${this.btcAmount || 0}, need ${neededBtc})`, 'portfolio');
-                        return false;
                     }
+                } catch (e) {
+                    console.warn('⚠️ Error evaluating auto-liquidation:', e && e.message ? e.message : e);
                 }
-            } catch (e) {
-                console.warn('⚠️ Error evaluating auto-liquidation:', e && e.message ? e.message : e);
-            }
 
-            // If auto-liquidation not enabled or failed, abort
-            return false;
+                // If auto-liquidation not enabled or failed, abort
+                return false;
+            }
         }
 
         // Actualizar balance en un solo paso para evitar doble contabilidad:
@@ -780,14 +804,16 @@ class Portfolio {
         try {
             trade.usdAmount = Number(trade.usdAmount) || 0;
             trade.amount = Number(trade.amount) || 0;
-            const available = Number(this.balance || 0);
-            if (trade.usdAmount + feeAmount > available) {
-                const prev = trade.usdAmount + feeAmount;
-                trade.usdAmount = Math.max(0, available - feeAmount);
-                trade.amount = trade.price > 0 ? Number(trade.usdAmount) / Number(trade.price) : 0;
-                const msg = `⚠️ Ajustado usdAmount para OPEN LONG: antes=${prev.toFixed(2)}, ahora=${(trade.usdAmount+feeAmount).toFixed(2)} (usdAmount=${trade.usdAmount.toFixed(2)}, fee=${feeAmount.toFixed(2)})`;
-                console.log(msg);
-                try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e) {}
+            if (!trade.forceSimple) {
+                const available = Number(this.balance || 0);
+                if (trade.usdAmount + feeAmount > available) {
+                    const prev = trade.usdAmount + feeAmount;
+                    trade.usdAmount = Math.max(0, available - feeAmount);
+                    trade.amount = trade.price > 0 ? Number(trade.usdAmount) / Number(trade.price) : 0;
+                    const msg = `⚠️ Ajustado usdAmount para OPEN LONG: antes=${prev.toFixed(2)}, ahora=${(trade.usdAmount+feeAmount).toFixed(2)} (usdAmount=${trade.usdAmount.toFixed(2)}, fee=${feeAmount.toFixed(2)})`;
+                    console.log(msg);
+                    try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e) {}
+                }
             }
         } catch (e) {
             console.warn('⚠️ Error calculando clamp de usdAmount para long:', e && e.message ? e.message : e);
@@ -802,14 +828,18 @@ class Portfolio {
 
         const totalCost = trade.usdAmount + feeAmount;
 
-        // Verificar si tenemos suficiente balance después del ajuste
-        if (this.balance < totalCost || trade.usdAmount <= 0) {
-            const message = `Balance insuficiente para abrir long tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
-            console.log('❌ ' + message);
-            await this.db.addLog('warning', message, 'portfolio');
-            return false;
+        // Verificar si tenemos suficiente balance después del ajuste (o forzar apertura en SIMPLE MODE)
+        if (!trade.forceSimple) {
+            if (this.balance < totalCost || trade.usdAmount <= 0) {
+                const message = `Balance insuficiente para abrir long tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
+                console.log('❌ ' + message);
+                await this.db.addLog('warning', message, 'portfolio');
+                return false;
+            }
         }
 
+        // Debitar el importe usado para la apertura (se considera reservado/consumido)
+        // En SIMPLE MODE permitimos balance negativo para forzar reinversión
         this.balance -= totalCost;
         this.btcAmount += trade.amount;
 
