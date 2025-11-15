@@ -593,84 +593,12 @@ class Portfolio {
                 btcAmount: Number(this.btcAmount || 0),
                 openPositionsCount: this.openPositions.length
             };
-            const message = `Balance insuficiente para cerrar short: disponible=$${availableForClose.toFixed(2)} < costo_total=$${cost.toFixed(2)}`;
-            console.log('❌ ' + message);
+            const message = `Balance insuficiente para cerrar short: disponible=$${availableForClose.toFixed(2)} < costo_total=$${cost.toFixed(2)} — se procederá al cierre y se aplicará el resultado de la operación al balance.`;
+            console.warn('⚠️ ' + message);
             console.log('⚠️ Diagnostic snapshot for insufficient-close:', diagnostic);
             try { await this.db.addLog('warning', `${message} | diagnostic=${JSON.stringify(diagnostic)}`, 'portfolio'); } catch(e) {}
-            // If running in SIMPLE MODE (test/forced behavior), allow the close anyway
-            if (this.simpleMode || trade.forceSimple) {
-                const fm = `⚠️ SIMPLE MODE / forceSimple: forzando cierre SHORT ${pos.id} aunque available=${availableForClose.toFixed(2)} < cost=${cost.toFixed(2)}`;
-                console.warn(fm);
-                try { await this.db.addLog('warning', fm, 'portfolio'); } catch(e) {}
-                // proceed with closure ignoring shortfall (balance may become negative)
-            } else {
-                // Optional auto-liquidation: if enabled, attempt to free USD by selling available long BTC
-                try {
-                    const autoFlag = process.env.AUTO_LIQUIDATE_ON_SHORT_CLOSE === '1';
-                    if (autoFlag) {
-                        const neededUsd = Math.max(0, cost - availableForClose);
-                        const neededBtc = exitPrice > 0 ? (neededUsd / exitPrice) : 0;
-                        if (neededBtc > 0 && (this.btcAmount || 0) >= neededBtc) {
-                            // Perform a lightweight liquidation: reduce btcAmount and add cash
-                            const liquidUsd = Number((neededBtc * exitPrice));
-                            this.btcAmount = Number(this.btcAmount) - Number(neededBtc);
-                            this.balance = Number(this.balance) + Number(liquidUsd);
-                            try {
-                                await this.db.addLog('info', `Auto-liquidación: vendiendo ${neededBtc.toFixed(8)} BTC por $${liquidUsd.toFixed(2)} para cubrir cierre SHORT ${pos.id}`, 'portfolio');
-                                const synth = {
-                                    id: this.generateTradeId(),
-                                    trade_id: this.generateTradeId(),
-                                    type: 'SELL',
-                                    amount: neededBtc,
-                                    price: exitPrice,
-                                    usd_amount: liquidUsd,
-                                    fee: 0,
-                                    timestamp: new Date(),
-                                    confidence: 0,
-                                    reasons: ['AUTO_LIQUIDATION_FOR_SHORT_CLOSE'],
-                                    balance_after: this.balance,
-                                    btc_after: this.btcAmount,
-                                    status: 'completed',
-                                    created_at: (new Date()).toISOString(),
-                                    entry_price: 0,
-                                    exit_price: exitPrice,
-                                    gain_loss: null,
-                                    roi: null,
-                                    related_trade_id: null,
-                                    position_side: 'long',
-                                    position_id: null,
-                                    action: 'auto_liquidation'
-                                };
-                                if (this.db && typeof this.db.saveTrade === 'function') {
-                                    await this.db.saveTrade(synth);
-                                    this.trades.unshift(synth);
-                                }
-                            } catch (e) {
-                                console.warn('⚠️ Error registrando auto-liquidación:', e && e.message ? e.message : e);
-                            }
-
-                            const newEntryUsd = Number(pos.entryUsd || 0);
-                            const newAvailable = Number(this.balance || 0) + newEntryUsd;
-                            if (newAvailable >= cost) {
-                                await this.db.addLog('info', `Auto-liquidación completada, available=${newAvailable.toFixed(2)} >= cost=${cost.toFixed(2)}. Procediendo con cierre SHORT ${pos.id}`, 'portfolio');
-                            } else {
-                                const msg2 = `Auto-liquidación insuficiente: available=${newAvailable.toFixed(2)} < cost=${cost.toFixed(2)}`;
-                                console.log('❌ ' + msg2);
-                                await this.db.addLog('warning', msg2, 'portfolio');
-                                return false;
-                            }
-                        } else {
-                            await this.db.addLog('warning', `AUTO_LIQUIDATE requested but insufficient BTC to liquidate (have ${this.btcAmount || 0}, need ${neededBtc})`, 'portfolio');
-                            return false;
-                        }
-                    }
-                } catch (e) {
-                    console.warn('⚠️ Error evaluating auto-liquidation:', e && e.message ? e.message : e);
-                }
-
-                // If auto-liquidation not enabled or failed, abort
-                return false;
-            }
+            // Según la política de la estrategia, siempre cerramos la posición y usamos el dinero resultante
+            // para la siguiente inversión; por tanto no retornamos false aquí.
         }
 
         // Actualizar balance en un solo paso para evitar doble contabilidad:
@@ -888,10 +816,10 @@ class Portfolio {
 
         // Verificar si tenemos suficiente BTC
         if (this.btcAmount < pos.amountBtc) {
-            const message = `BTC insuficiente para cerrar long: ${this.btcAmount.toFixed(8)} < ${pos.amountBtc.toFixed(8)}`;
-            console.log('❌ ' + message);
-            await this.db.addLog('warning', message, 'portfolio');
-            return false;
+            const message = `BTC insuficiente para cerrar long: ${this.btcAmount.toFixed(8)} < ${pos.amountBtc.toFixed(8)} — forzando cierre según política de estrategia (usar resultado para siguiente apertura).`;
+            console.warn('⚠️ ' + message);
+            try { await this.db.addLog('warning', message, 'portfolio'); } catch(e) {}
+            // Proceder con el cierre aun cuando falte BTC (podría dejar btcAmount negativo)
         }
 
         const netAmount = trade.usdAmount - trade.fee;
