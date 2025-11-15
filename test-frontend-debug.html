@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Stochastic Chart</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>Test Gráfico Estocástico</h1>
+    <canvas id="stochasticChart15m" width="800" height="400"></canvas>
+    
+    <script>
+        let stochChart15m = null;
+        let stochHistory = {
+            timestamps: [],
+            k15m: [],
+            d15m: []
+        };
+        const maxHistoryPoints = 10;
+        
+        function initializeChart() {
+            console.log('Inicializando gráfico de prueba...');
+            const ctx = document.getElementById('stochasticChart15m');
+            if (!ctx) {
+                console.log('Canvas no encontrado');
+                return;
+            }
+            
+            stochChart15m = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'K (15m)',
+                        data: [],
+                        borderColor: '#60a5fa',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.1
+                    }, {
+                        label: 'D (15m)',
+                        data: [],
+                        borderColor: '#fbbf24',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    scales: {
+                        y: { min: 0, max: 100 }
+                    }
+                }
+            });
+            console.log('Gráfico inicializado');
+        }
+        
+        function updateStochasticChart(k, d) {
+            console.log('Actualizando gráfico con K=' + k + ', D=' + d);
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+            
+            stochHistory.timestamps.push(timeStr);
+            stochHistory.k15m.push(k);
+            stochHistory.d15m.push(d);
+            
+            if (stochHistory.timestamps.length > maxHistoryPoints) {
+                stochHistory.timestamps.shift();
+                stochHistory.k15m.shift();
+                stochHistory.d15m.shift();
+            }
+            
+            if (stochChart15m) {
+                stochChart15m.data.labels = stochHistory.timestamps;
+                stochChart15m.data.datasets[0].data = stochHistory.k15m;
+                stochChart15m.data.datasets[1].data = stochHistory.d15m;
+                stochChart15m.update();
+                console.log('Gráfico actualizado');
+            } else {
+                console.log('Gráfico no inicializado');
+            }
+        }
+        
+        // Inicializar
+        initializeChart();
+        
+        // Simular actualizaciones
+        let count = 0;
+        setInterval(() => {
+            const k = 30 + Math.random() * 40; // Valor entre 30-70
+            const d = 25 + Math.random() * 50; // Valor entre 25-75
+            updateStochasticChart(k, d);
+            count++;
+            if (count >= 5) {
+                console.log('Test completado - revisa si el gráfico se actualiza');
+            }
+        }, 2000);
+    </script>
+</body>
+</html>

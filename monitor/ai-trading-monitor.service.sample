@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Trading Simulator Monitor (sample)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/agubot.ddns.net/ai-trading-simulator
+ExecStart=/bin/bash /var/www/agubot.ddns.net/ai-trading-simulator/monitor/monitor_alerts.sh
+User=agustin
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
