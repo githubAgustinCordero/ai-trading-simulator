@@ -489,7 +489,8 @@ class Portfolio {
         } catch (e) {}
 
         const totalCost = trade.usdAmount + feeAmount;
-        if (!trade.forceSimple) {
+        // If neither forceSimple nor simpleMode are set, require sufficient cash
+        if (!trade.forceSimple && !this.simpleMode) {
             if (this.balance < totalCost || trade.usdAmount <= 0) {
                 const msg = `Balance insuficiente o monto nulo para abrir short tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
                 console.log('❌ ' + msg);
@@ -759,7 +760,8 @@ class Portfolio {
         const totalCost = trade.usdAmount + feeAmount;
 
         // Verificar si tenemos suficiente balance después del ajuste (o forzar apertura en SIMPLE MODE)
-        if (!trade.forceSimple) {
+        // Require sufficient cash only when not in simpleMode and not forcing simple on this trade
+        if (!trade.forceSimple && !this.simpleMode) {
             if (this.balance < totalCost || trade.usdAmount <= 0) {
                 const message = `Balance insuficiente para abrir long tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
                 console.log('❌ ' + message);
