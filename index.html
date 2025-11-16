@@ -473,6 +473,29 @@
             .dashboard {
                 grid-template-columns: repeat(2, 1fr);
             }
+
+            async forceSync() {
+                try {
+                    const response = await fetch('/api/bot/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                    const result = await response.json();
+                    if (result && result.success) {
+                        this.showAlert('Sincronización forzada: ' + (result.message || 'OK'), 'success');
+                        this.addLogEntry('Forzado rebuild ejecutado correctamente', 'success');
+                    } else {
+                        this.showAlert('Error forzando sincronización: ' + (result && result.message ? result.message : 'unknown'), 'error');
+                    }
+                } catch (err) {
+                    console.error('Error forzando sincronización:', err);
+                    this.showAlert('Error al forzar sincronización: ' + (err.message || err), 'error');
+                }
+
+                // Siempre intentar recargar datos del servidor después del rebuild
+                try {
+                    await this.fetchData();
+                } catch (err) {
+                    console.warn('fetchData fallo después de forceSync:', err);
+                }
+            }
         }
 
         @media (max-width: 900px) {
@@ -941,6 +964,7 @@
                 <button id="startBot" class="btn btn-start">▶️ Iniciar Bot</button>
                 <button id="stopBot" class="btn btn-stop">⏹️ Detener Bot</button>
                 <button id="resetBot" class="btn btn-reset">🔄 Reiniciar</button>
+                    <button id="forceSyncBtn" class="btn-clear">🔁 Forzar Sync</button>
                 <button id="themeToggle" class="btn btn-theme">🌙 Modo Oscuro</button>
             </div>
         </header>
@@ -1680,6 +1704,15 @@
                     }
                 });
 
+                const forceBtn = document.getElementById('forceSyncBtn');
+                if (forceBtn) {
+                    forceBtn.addEventListener('click', () => {
+                        if (confirm('Forzar sincronización con el servidor (rebuild)?')) {
+                            this.forceSync();
+                        }
+                    });
+                }
+
                 // Event listeners para selector de estrategias
                 document.querySelectorAll('.strategy-option').forEach(option => {
                     option.addEventListener('click', () => {
@@ -1913,20 +1946,19 @@
                     const data = await response.json();
                     
                     if (data.success) {
-                        // Validar datos antes de aceptarlos
+                        // Validación relajada: aceptar actualizaciones cuando el totalValue es razonable
+                        // Nota: en SIMPLE MODE el backend puede reportar balance=0 temporalmente,
+                        // por eso no exigimos balance >= 1000 aquí.
                         const portfolio = data.data.portfolio || {};
-                        const isValidData = portfolio.totalValue >= 1000 && portfolio.balance >= 1000;
-                        
+                        const isValidData = (typeof portfolio.totalValue === 'number' && portfolio.totalValue >= 1000);
                         if (!isValidData) {
-                            console.error('🚨 fetchData recibió datos INVÁLIDOS:', {
-                                totalValue: portfolio.totalValue,
-                                balance: portfolio.balance,
-                                btcAmount: portfolio.btcAmount,
-                                currentBtcPrice: data.data.market?.price,
-                                fullPortfolio: portfolio,
-                                timestamp: new Date().toISOString()
-                            });
-                            return; // No actualizar con datos inválidos
+                            // Si no hay un totalValue razonable, aceptamos la respuesta sólo si
+                            // el backend incluye posiciones abiertas explícitas (fallback).
+                            const hasPositions = Array.isArray(data.data.positions && data.data.positions.open) && data.data.positions.open.length > 0;
+                            if (!hasPositions) {
+                                console.error('🚨 fetchData recibió datos INVÁLIDOS y sin posiciones abiertas:', { totalValue: portfolio.totalValue, balance: portfolio.balance });
+                                return; // No actualizar con datos inválidos y sin posiciones
+                            }
                         }
                         
                         // Log cuando el valor cambia significativamente
@@ -2696,7 +2728,7 @@
         // Inicializar dashboard cuando la página se carga
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedTheme();
-            new TradingDashboard();
+            window.dashboard = new TradingDashboard();
         });
     </script>
 </body>
