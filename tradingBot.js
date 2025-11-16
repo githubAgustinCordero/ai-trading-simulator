@@ -263,7 +263,7 @@ class TradingBot {
         }
     }
 
-    const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD) || 1; // configurable minimum order size
+    const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD || 0); // configurable minimum order size (default 0 => always allow)
     if (tradeAmount < MIN_ORDER_USD) {
         console.log('ℹ️ No se abre LONG: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedLongUsd, MIN_ORDER_USD });
         return false;
@@ -431,7 +431,7 @@ class TradingBot {
     }
 
     if (tradeAmount < 10) {
-        const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD) || 1;
+        const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD || 0);
         console.log('ℹ️ No se abre SHORT: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedShortUsd, MIN_ORDER_USD });
         return false;
     }
