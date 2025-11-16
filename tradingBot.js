@@ -204,15 +204,17 @@ class TradingBot {
         }
     }
 
-    // Deseamos invertir TODO el totalValue (clamp parcial a cash si necesario)
+    // Deseamos invertir TODO el totalValue
     const openPositions = Array.isArray(this.portfolio.openPositions) ? this.portfolio.openPositions : [];
     const investedLongUsd = openPositions
         .filter(p => p.side === 'long')
         .reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0);
 
     let tradeAmount = Number(totalValue || 0);
-    // Clamp to available cash to avoid attempting to spend more than balance
-    tradeAmount = Math.min(tradeAmount, balanceForSizing);
+    // Only clamp to available cash when NOT in SIMPLE MODE (we want to invest full totalValue in SIMPLE MODE)
+    if (!this.portfolio.simpleMode) {
+        tradeAmount = Math.min(tradeAmount, balanceForSizing);
+    }
     if (closedOpposite) {
         try {
             // Ensure we reload DB state after the close to have canonical values
@@ -388,8 +390,10 @@ class TradingBot {
 
     // Deseamos invertir TODO el totalValueShort
     let tradeAmount = Number(totalValueShort || 0);
-    // Clamp to available cash to avoid attempting to spend more than balance
-    tradeAmount = Math.min(tradeAmount, balanceForSizingShort);
+    // Only clamp to available cash when NOT in SIMPLE MODE
+    if (!this.portfolio.simpleMode) {
+        tradeAmount = Math.min(tradeAmount, balanceForSizingShort);
+    }
     if (closedOppositeShort) {
         try {
             const dbStateAfter = (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') ? await this.portfolio.db.getPortfolioState() : null;

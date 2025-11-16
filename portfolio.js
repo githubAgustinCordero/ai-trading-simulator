@@ -464,7 +464,8 @@ class Portfolio {
 
         // Enforce: clamp requested usdAmount to available balance (portfolio-side enforcement)
         try {
-            if (!trade.forceSimple) {
+            // Respect SIMPLE MODE: if portfolio is in simpleMode or trade.forceSimple is set, skip clamping to cash
+            if (!trade.forceSimple && !this.simpleMode) {
                 const available = Number(this.balance || 0);
                 if (trade.usdAmount + feeAmount > available) {
                     const prev = trade.usdAmount + feeAmount;
@@ -732,7 +733,8 @@ class Portfolio {
         try {
             trade.usdAmount = Number(trade.usdAmount) || 0;
             trade.amount = Number(trade.amount) || 0;
-            if (!trade.forceSimple) {
+            // Respect SIMPLE MODE: skip clamp when portfolio is in simpleMode or trade.forceSimple is set
+            if (!trade.forceSimple && !this.simpleMode) {
                 const available = Number(this.balance || 0);
                 if (trade.usdAmount + feeAmount > available) {
                     const prev = trade.usdAmount + feeAmount;
