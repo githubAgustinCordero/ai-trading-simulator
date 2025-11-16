@@ -430,9 +430,9 @@ class TradingBot {
         }
     }
 
-    if (tradeAmount < 10) {
-        const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD || 0);
-        console.log('ℹ️ No se abre SHORT: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedShortUsd, MIN_ORDER_USD });
+    const MIN_ORDER_USD_SHORT = Number(process.env.MIN_ORDER_USD || 0);
+    if (tradeAmount < MIN_ORDER_USD_SHORT) {
+        console.log('ℹ️ No se abre SHORT: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedShortUsd, MIN_ORDER_USD_SHORT });
         return false;
     }
     console.log(`📐 Tamaño de orden calculado (SHORT): totalValue=$${Number(totalValueShort||0).toFixed(2)}, investedShortUsd=$${investedShortUsd.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)} (usando cash=$${balanceForSizingShort.toFixed(2)})`);
@@ -621,8 +621,9 @@ class TradingBot {
                 console.warn('⚠️ Error registrando audit en switchPosition:', e && e.message ? e.message : e);
             }
 
-            if (finalUsd < 10) {
-                console.log('ℹ️ Switch aborted: monto final demasiado pequeño o cash insuficiente', { desiredUsd, finalUsd, balanceAfterClose });
+            const MIN_ORDER_USD_SWITCH = Number(process.env.MIN_ORDER_USD || 0);
+            if (finalUsd < MIN_ORDER_USD_SWITCH) {
+                console.log('ℹ️ Switch aborted: monto final demasiado pequeño o cash insuficiente', { desiredUsd, finalUsd, balanceAfterClose, MIN_ORDER_USD_SWITCH });
                 return false;
             }
 
