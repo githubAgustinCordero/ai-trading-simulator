@@ -152,32 +152,50 @@ class TradingBot {
                     return false;
                 }
                 closedOpposite = true;
-                // Sync position after close
+                // Sync position after close and wait until DB+memory confirm closure
                 await this.syncCurrentPosition();
+                await this.waitForPositionClosed('short', 5000, 200);
+                // -- SIMPLE MODE: force in-memory balance to total_value so we can reinvest immediately
+                try {
+                    const fallbackTotal = Number(this.portfolio.getTotalValue(price)) || 0;
+                    console.log(`⚠️ SIMPLE MODE: forzando balance en memoria a total_value=$${fallbackTotal.toFixed(2)} para reinversión inmediata`);
+                    this.portfolio.balance = Number(fallbackTotal);
+                } catch (e) {
+                    console.warn('⚠️ No se pudo forzar balance en memoria:', e && e.message ? e.message : e);
+                }
             }
         } catch (e) {
             console.error('Error intentando cerrar SHORT antes de abrir LONG:', e && e.message ? e.message : e);
             return false;
         }
 
-    // Nuevo comportamiento: calcular objetivo como 50% del VALOR TOTAL del portafolio
-    // y abrir hasta la cantidad necesaria para alcanzar esa exposición, usando efectivo disponible.
+    // Nuevo comportamiento simplificado: invertir TODO el valor total del portafolio
+    // Leer estado DB y calcular totalValue (fuente de verdad)
     let balanceForSizing = Number(this.portfolio.balance || 0);
     let totalValue = null;
     try {
+        // Force a fresh in-memory reload to avoid using stale cached state
+        try {
+            if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') {
+                await this.portfolio.loadFromDatabase();
+            }
+        } catch (e) {
+            console.warn('⚠️ No se pudo recargar portfolio antes de sizing (no crítico):', e && e.message ? e.message : e);
+        }
+
         if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') {
             const dbState = await this.portfolio.db.getPortfolioState();
             if (dbState) {
                 if (typeof dbState.balance === 'number') balanceForSizing = Number(dbState.balance);
                 if (typeof dbState.total_value === 'number') totalValue = Number(dbState.total_value);
-                console.log(`🛰️ Usando estado DB para sizing: balance=$${balanceForSizing.toFixed(2)}, totalValue=${totalValue !== null ? '$'+totalValue.toFixed(2) : 'N/A'}`);
+                const inMemoryTotal = (() => { try { return Number(this.portfolio.getTotalValue(price)); } catch(_) { return null; } })();
+                console.log(`🛰️ Usando estado DB para sizing: db.balance=$${balanceForSizing.toFixed(2)}, db.total_value=${totalValue !== null ? '$'+totalValue.toFixed(2) : 'N/A'}, inMemoryTotal=${inMemoryTotal !== null ? '$'+inMemoryTotal.toFixed(2) : 'N/A'}`);
             }
         }
     } catch (err) {
         console.warn('⚠️ No se pudo leer estado desde DB para sizing, usando valores en memoria:', err && err.message ? err.message : err);
     }
 
-    // Fallback: si no hay totalValue en DB, calcular desde el objeto portfolio (requiere precio)
     if (totalValue === null) {
         try {
             totalValue = Number(this.portfolio.getTotalValue(price)) || Number(this.portfolio.initialBalance || 0);
@@ -186,73 +204,71 @@ class TradingBot {
         }
     }
 
-    // Calcular exposición ya invertida en longs
+    // Deseamos invertir TODO el totalValue (clamp parcial a cash si necesario)
     const openPositions = Array.isArray(this.portfolio.openPositions) ? this.portfolio.openPositions : [];
     const investedLongUsd = openPositions
         .filter(p => p.side === 'long')
         .reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0);
 
-    const targetExposure = totalValue * 0.5; // objetivo: 50% del valor total
-    let additionalNeeded = Math.max(0, targetExposure - investedLongUsd);
-
-    // If we just closed the opposite position, use the updated cash balance and open with 50% of that cash
-    let tradeAmount = Math.min(additionalNeeded, balanceForSizing);
-            if (closedOpposite) {
-                try {
-                    // Prefer reading the updated total_value from DB after the close
-                    const dbStateAfter = (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') ? await this.portfolio.db.getPortfolioState() : null;
-                    // Debug: mostrar estado crudo leído desde la BDD justo después del cierre
-                    try { console.log('🛰️ DB raw state after close:', dbStateAfter); } catch (e) {}
-
-                    // Ensure in-memory portfolio reloads trades/state from DB so exposures are accurate
-                    try {
-                        if (typeof this.portfolio.loadFromDatabase === 'function') {
-                            await this.portfolio.loadFromDatabase();
-                        }
-                    } catch (e) {
-                        console.warn('⚠️ No se pudo recargar portfolio desde DB:', e && e.message ? e.message : e);
-                    }
-
-                    let totalValueAfterClose = null;
-                    if (dbStateAfter && typeof dbStateAfter.total_value === 'number') {
-                        totalValueAfterClose = Number(dbStateAfter.total_value);
-                    } else if (dbStateAfter && typeof dbStateAfter.totalValue === 'number') {
-                        totalValueAfterClose = Number(dbStateAfter.totalValue);
-                    } else {
-                        // Fallback: compute from in-memory portfolio
-                        try {
-                            totalValueAfterClose = Number(this.portfolio.getTotalValue(price)) || Number(this.portfolio.balance || 0);
-                        } catch (err) {
-                            totalValueAfterClose = Number(this.portfolio.balance || 0);
-                        }
-                    }
-
-                    // Recompute exposures from freshly loaded in-memory positions
-                    const investedLongAfter = Array.isArray(this.portfolio.openPositions) ? this.portfolio.openPositions.filter(p => p.side === 'long').reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0) : 0;
-                    const targetExposureAfter = totalValueAfterClose * 0.5;
-                    const additionalNeededAfter = Math.max(0, targetExposureAfter - investedLongAfter);
-
-                    // Desired trade amount is the additional needed to reach 50% of updated total
-                    tradeAmount = additionalNeededAfter;
-
-                    // If cash is insufficient, clamp to available balance but log the condition
-                    const availableCash = dbStateAfter && typeof dbStateAfter.balance === 'number' ? Number(dbStateAfter.balance) : Number(this.portfolio.balance || 0);
-                    if (tradeAmount > availableCash) {
-                        console.log(`⚠️ Cash insufficient to reach targetExposure: desired=$${tradeAmount.toFixed(2)}, available=$${availableCash.toFixed(2)} — will clamp to available`);
-                        tradeAmount = Math.floor(availableCash * 100) / 100;
-                    }
-
-                    console.log(`🔁 Closed opposite position — recalculando sizing desde totalValue: totalValueAfterClose=$${totalValueAfterClose.toFixed(2)}, targetExposure=$${targetExposureAfter.toFixed(2)}, investedLongAfter=$${investedLongAfter.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)}`);
-                } catch (e) {
-                    console.warn('⚠️ Error leyendo estado después de cerrar posición, usando sizing previo:', e && e.message ? e.message : e);
+    let tradeAmount = Number(totalValue || 0);
+    // Clamp to available cash to avoid attempting to spend more than balance
+    tradeAmount = Math.min(tradeAmount, balanceForSizing);
+    if (closedOpposite) {
+        try {
+            // Ensure we reload DB state after the close to have canonical values
+            try {
+                if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') await this.portfolio.loadFromDatabase();
+            } catch (e) {
+                console.warn('⚠️ No se pudo recargar portfolio tras cierre (no crítico):', e && e.message ? e.message : e);
+            }
+            const dbStateAfter = (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') ? await this.portfolio.db.getPortfolioState() : null;
+            try { console.log('🛰️ DB raw state after close:', dbStateAfter); } catch (e) {}
+            try {
+                if (typeof this.portfolio.loadFromDatabase === 'function') {
+                    await this.portfolio.loadFromDatabase();
                 }
+            } catch (e) {
+                console.warn('⚠️ No se pudo recargar portfolio desde DB:', e && e.message ? e.message : e);
             }
 
-    if (tradeAmount < 10) {
-        console.log('ℹ️ No se abre LONG: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, additionalNeeded, investedLongUsd, targetExposure });
+            let totalValueAfterClose = null;
+            if (dbStateAfter && typeof dbStateAfter.total_value === 'number') totalValueAfterClose = Number(dbStateAfter.total_value);
+            else if (dbStateAfter && typeof dbStateAfter.totalValue === 'number') totalValueAfterClose = Number(dbStateAfter.totalValue);
+            else {
+                try {
+                    totalValueAfterClose = Number(this.portfolio.getTotalValue(price)) || Number(this.portfolio.balance || 0);
+                } catch (err) {
+                    totalValueAfterClose = Number(this.portfolio.balance || 0);
+                }
+            }
+                    // Debug: show both DB and in-memory total for diagnosis
+                    let inMemoryTotalForDebug = null;
+                    try { inMemoryTotalForDebug = Number(this.portfolio.getTotalValue(price)); } catch(e) { inMemoryTotalForDebug = null; }
+                    try { console.log(`🛰️ totalValueAfterClose (db)=${totalValueAfterClose}, totalValueAfterClose(inMemory)=${inMemoryTotalForDebug !== null ? '$'+inMemoryTotalForDebug.toFixed(2) : 'N/A'}`); } catch(e){}
+
+            // If DB reports zero/negative total_value (likely due to DB snapshot), prefer a healthy in-memory total when available
+            if ((totalValueAfterClose === null || totalValueAfterClose <= 0) && inMemoryTotalForDebug && inMemoryTotalForDebug > 0) {
+                console.log(`⚠️ DB total_value is ${totalValueAfterClose}; falling back to in-memory total_value $${inMemoryTotalForDebug.toFixed(2)} for sizing`);
+                totalValueAfterClose = inMemoryTotalForDebug;
+            }
+
+            // invertir el totalValueAfterClose
+            tradeAmount = Number(totalValueAfterClose || 0);
+
+            // Si el cash disponible es menor, hacemos clamp al efectivo disponible para no fallar
+            // SIMPLE MODE: ignore cash clamp and invest the full totalValueAfterClose (or in-memory fallback)
+            console.log(`🔁 Closed opposite position (SIMPLE MODE) — usando total_value para sizing: totalValueAfterClose=$${(totalValueAfterClose||0).toFixed(2)}, investedLongAfter=${investedLongUsd.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)}`);
+        } catch (e) {
+            console.warn('⚠️ Error leyendo estado después de cerrar posición, usando sizing previo:', e && e.message ? e.message : e);
+        }
+    }
+
+    const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD) || 1; // configurable minimum order size
+    if (tradeAmount < MIN_ORDER_USD) {
+        console.log('ℹ️ No se abre LONG: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedLongUsd, MIN_ORDER_USD });
         return false;
     }
-    console.log(`📐 Tamaño de orden calculado (LONG): totalValue=$${totalValue.toFixed(2)}, investedLongUsd=$${investedLongUsd.toFixed(2)}, targetExposure=$${targetExposure.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)} (usando cash=$${balanceForSizing.toFixed(2)})`);
+    console.log(`📐 Tamaño de orden calculado (LONG): totalValue=$${Number(totalValue||0).toFixed(2)}, investedLongUsd=$${investedLongUsd.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)} (usando cash=$${balanceForSizing.toFixed(2)})`);
     const btcAmount = tradeAmount / price;
         // Fee removed for simulation/testing per request
         const fee = 0;
@@ -271,6 +287,7 @@ class TradingBot {
             positionSide: 'long',
             action: 'open'
         };
+        if (closedOpposite) trade.forceSimple = true;
 
         const ok = await this.portfolio.executeTrade(trade);
         if (ok) {
@@ -323,15 +340,24 @@ class TradingBot {
                     return false;
                 }
                 closedOppositeShort = true;
-                // Sync position after close
+                // Sync position after close and wait until DB+memory confirm closure
                 await this.syncCurrentPosition();
+                await this.waitForPositionClosed('long', 5000, 200);
+                // -- SIMPLE MODE: force in-memory balance to total_value so we can reinvest immediately
+                try {
+                    const fallbackTotal = Number(this.portfolio.getTotalValue(price)) || 0;
+                    console.log(`⚠️ SIMPLE MODE: forzando balance en memoria a total_value=$${fallbackTotal.toFixed(2)} para reinversión inmediata`);
+                    this.portfolio.balance = Number(fallbackTotal);
+                } catch (e) {
+                    console.warn('⚠️ No se pudo forzar balance en memoria:', e && e.message ? e.message : e);
+                }
             }
         } catch (e) {
             console.error('Error intentando cerrar LONG antes de abrir SHORT:', e && e.message ? e.message : e);
             return false;
         }
 
-    // Nuevo comportamiento: calcular objetivo como 50% del VALOR TOTAL del portafolio (SHORT)
+    // Nuevo comportamiento: invertir TODO el valor total del portafolio (SHORT)
     let balanceForSizingShort = Number(this.portfolio.balance || 0);
     let totalValueShort = null;
     try {
@@ -360,16 +386,14 @@ class TradingBot {
         .filter(p => p.side === 'short')
         .reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0);
 
-    const targetExposureShort = totalValueShort * 0.5;
-    let additionalNeededShort = Math.max(0, targetExposureShort - investedShortUsd);
-
-    let tradeAmount = Math.min(additionalNeededShort, balanceForSizingShort);
+    // Deseamos invertir TODO el totalValueShort
+    let tradeAmount = Number(totalValueShort || 0);
+    // Clamp to available cash to avoid attempting to spend more than balance
+    tradeAmount = Math.min(tradeAmount, balanceForSizingShort);
     if (closedOppositeShort) {
         try {
             const dbStateAfter = (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') ? await this.portfolio.db.getPortfolioState() : null;
-            // Debug: mostrar estado crudo leído desde la BDD justo después del cierre (SHORT)
             try { console.log('🛰️ DB raw state after close (SHORT):', dbStateAfter); } catch (e) {}
-            // Ensure in-memory portfolio reloads trades/state from DB so exposures are accurate
             try {
                 if (typeof this.portfolio.loadFromDatabase === 'function') {
                     await this.portfolio.loadFromDatabase();
@@ -378,7 +402,6 @@ class TradingBot {
                 console.warn('⚠️ No se pudo recargar portfolio desde DB (SHORT):', e && e.message ? e.message : e);
             }
 
-            // Compute using updated totalValue and exposures
             let totalValueAfterCloseShort = null;
             if (dbStateAfter && typeof dbStateAfter.total_value === 'number') totalValueAfterCloseShort = Number(dbStateAfter.total_value);
             else if (dbStateAfter && typeof dbStateAfter.totalValue === 'number') totalValueAfterCloseShort = Number(dbStateAfter.totalValue);
@@ -386,27 +409,33 @@ class TradingBot {
                 try { totalValueAfterCloseShort = Number(this.portfolio.getTotalValue(price)) || Number(this.portfolio.balance || 0); } catch (e) { totalValueAfterCloseShort = Number(this.portfolio.balance || 0); }
             }
 
-            const investedShortAfter = Array.isArray(this.portfolio.openPositions) ? this.portfolio.openPositions.filter(p => p.side === 'short').reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0) : 0;
-            const targetExposureShortAfter = totalValueAfterCloseShort * 0.5;
-            const additionalNeededShortAfter = Math.max(0, targetExposureShortAfter - investedShortAfter);
-            tradeAmount = additionalNeededShortAfter;
+            // Debug: show both DB and in-memory total for diagnosis
+            let inMemoryTotalForDebugShort = null;
+            try { inMemoryTotalForDebugShort = Number(this.portfolio.getTotalValue(price)); } catch(e) { inMemoryTotalForDebugShort = null; }
+            try { console.log(`🛰️ totalValueAfterClose (db)=${totalValueAfterCloseShort}, totalValueAfterClose(inMemory)=${inMemoryTotalForDebugShort !== null ? '$'+inMemoryTotalForDebugShort.toFixed(2) : 'N/A'}`); } catch(e){}
 
-            const availableCashShort = dbStateAfter && typeof dbStateAfter.balance === 'number' ? Number(dbStateAfter.balance) : Number(this.portfolio.balance || 0);
-            if (tradeAmount > availableCashShort) {
-                console.log(`⚠️ Cash insufficient to reach targetExposure (SHORT): desired=$${tradeAmount.toFixed(2)}, available=$${availableCashShort.toFixed(2)} — will clamp to available`);
-                tradeAmount = Math.floor(availableCashShort * 100) / 100;
+            // If DB reports zero/negative total_value, prefer a healthy in-memory total when available
+            if ((totalValueAfterCloseShort === null || totalValueAfterCloseShort <= 0) && inMemoryTotalForDebugShort && inMemoryTotalForDebugShort > 0) {
+                console.log(`⚠️ DB total_value is ${totalValueAfterCloseShort}; falling back to in-memory total_value $${inMemoryTotalForDebugShort.toFixed(2)} for sizing (SHORT)`);
+                totalValueAfterCloseShort = inMemoryTotalForDebugShort;
             }
-            console.log(`🔁 Closed opposite position — recalculando sizing (SHORT) desde totalValue: totalValueAfterClose=$${totalValueAfterCloseShort.toFixed(2)}, targetExposure=$${targetExposureShortAfter.toFixed(2)}, investedShortAfter=$${investedShortAfter.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)}`);
+
+            // invertir el totalValueAfterCloseShort
+            tradeAmount = Number(totalValueAfterCloseShort || 0);
+
+            // SIMPLE MODE: ignore cash clamp and invest the full totalValueAfterCloseShort (or in-memory fallback)
+            console.log(`🔁 Closed opposite position (SIMPLE MODE) — usando total_value para sizing (SHORT): totalValueAfterClose=$${(totalValueAfterCloseShort||0).toFixed(2)}, investedShortAfter=${investedShortUsd.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)}`);
         } catch (e) {
             console.warn('⚠️ Error leyendo balance después de cerrar posición (SHORT), usando sizing previo:', e && e.message ? e.message : e);
         }
     }
 
     if (tradeAmount < 10) {
-        console.log('ℹ️ No se abre SHORT: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, additionalNeededShort, investedShortUsd, targetExposureShort });
+        const MIN_ORDER_USD = Number(process.env.MIN_ORDER_USD) || 1;
+        console.log('ℹ️ No se abre SHORT: monto calculado demasiado pequeño o objetivo ya alcanzado', { tradeAmount, investedShortUsd, MIN_ORDER_USD });
         return false;
     }
-    console.log(`📐 Tamaño de orden calculado (SHORT): totalValue=$${totalValueShort.toFixed(2)}, investedShortUsd=$${investedShortUsd.toFixed(2)}, targetExposure=$${targetExposureShort.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)} (usando cash=$${balanceForSizingShort.toFixed(2)})`);
+    console.log(`📐 Tamaño de orden calculado (SHORT): totalValue=$${Number(totalValueShort||0).toFixed(2)}, investedShortUsd=$${investedShortUsd.toFixed(2)}, tradeAmount=$${tradeAmount.toFixed(2)} (usando cash=$${balanceForSizingShort.toFixed(2)})`);
     const btcAmount = tradeAmount / price;
         // Fee removed for simulation/testing per request
         const fee = 0;
@@ -426,6 +455,7 @@ class TradingBot {
             action: 'open'
         };
 
+        if (closedOppositeShort) trade.forceSimple = true;
         const ok = await this.portfolio.executeTrade(trade);
         if (ok) {
             this.lastTradeTime = Date.now();
@@ -489,6 +519,35 @@ class TradingBot {
         }
     }
 
+    // Wait until a given side position is fully closed (both in-memory and DB), with timeout
+    async waitForPositionClosed(side, timeoutMs = 5000, pollMs = 200) {
+        try {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+                try {
+                    if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') {
+                        await this.portfolio.loadFromDatabase();
+                    }
+                } catch (e) {
+                    // non-fatal
+                }
+                await this.syncCurrentPosition();
+
+                const inMemoryHas = this.currentPosition && this.currentPosition.side === side;
+                const dbHas = Array.isArray(this.portfolio.openPositions) && this.portfolio.openPositions.some(p => p.side === side);
+                if (!inMemoryHas && !dbHas) {
+                    return true;
+                }
+                await new Promise(r => setTimeout(r, pollMs));
+            }
+            console.warn(`⚠️ waitForPositionClosed: timeout waiting for ${side} to close`);
+            return false;
+        } catch (e) {
+            console.warn('⚠️ Error en waitForPositionClosed:', e && e.message ? e.message : e);
+            return false;
+        }
+    }
+
     // Atomic switch: cierra la posición opuesta, espera el estado DB, recalcula sizing y abre la nueva posición.
     // targetSide: 'long' | 'short'
     async switchPosition(targetSide, price, confidence = 80, reasons = [], signals = {}) {
@@ -502,6 +561,17 @@ class TradingBot {
                 if (!closed) {
                     console.log(`❌ No se pudo cerrar ${opposite} — abortando switch a ${targetSide}`);
                     return false;
+                }
+                // Ensure DB and memory reflect the close before continuing
+                await this.syncCurrentPosition();
+                await this.waitForPositionClosed(opposite, 5000, 200);
+                // SIMPLE MODE: force in-memory balance to total_value so we can reinvest immediately
+                try {
+                    const fallbackTotal = Number(this.portfolio.getTotalValue(price)) || 0;
+                    console.log(`⚠️ SIMPLE MODE: forzando balance en memoria a total_value=$${fallbackTotal.toFixed(2)} para reinversión inmediata (switch)`);
+                    this.portfolio.balance = Number(fallbackTotal);
+                } catch (e) {
+                    console.warn('⚠️ No se pudo forzar balance en memoria (switch):', e && e.message ? e.message : e);
                 }
             }
 
@@ -527,15 +597,22 @@ class TradingBot {
             const totalValueAfterClose = dbStateAfter && typeof dbStateAfter.total_value === 'number' ? Number(dbStateAfter.total_value) : (this.portfolio ? Number(this.portfolio.getTotalValue(price) || 0) : 0);
             const balanceAfterClose = dbStateAfter && typeof dbStateAfter.balance === 'number' ? Number(dbStateAfter.balance) : (this.portfolio ? Number(this.portfolio.balance || 0) : 0);
 
-            const targetExposure = totalValueAfterClose * 0.5;
+            // Use full total value as the target exposure (invest all)
+            const targetExposure = Number(totalValueAfterClose || 0);
             const investedAfter = Array.isArray(this.portfolio.openPositions) ? this.portfolio.openPositions.filter(p => p.side === targetSide).reduce((s, p) => s + (Number(p.entryUsd || (p.amountBtc * (p.entryPrice || price))) || 0), 0) : 0;
             const desiredUsd = Math.max(0, targetExposure - investedAfter);
 
-            let finalUsd = Math.min(desiredUsd, balanceAfterClose);
+            // SIMPLE MODE: invest the in-memory total value after close regardless of DB cash
+            let finalUsd = 0;
+            try {
+                finalUsd = Number(this.portfolio.getTotalValue(price)) || Number(desiredUsd || 0);
+            } catch (e) {
+                finalUsd = Number(desiredUsd || 0);
+            }
             // Clamp to 2 decimals
             finalUsd = Math.floor(finalUsd * 100) / 100;
 
-            // Audit requested vs final
+            // Audit requested vs final (requested = desired to reach full total)
             try {
                 if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.addTradeAudit === 'function') {
                     await this.portfolio.db.addTradeAudit({ tradeId: null, requestedUsd: desiredUsd, finalUsd: finalUsd, balanceSnapshot: balanceAfterClose, note: `SWITCH_ATOMIC to ${targetSide}` });
@@ -563,7 +640,10 @@ class TradingBot {
                 action: 'open'
             };
 
-            console.log(`📐 switchPosition: totalAfter=$${totalValueAfterClose.toFixed(2)}, targetExposure=$${targetExposure.toFixed(2)}, investedAfter=$${investedAfter.toFixed(2)}, requested=${desiredUsd.toFixed(2)}, final=${finalUsd.toFixed(2)}`);
+            // In SIMPLE MODE, allow immediate reinvestment after the close
+            trade.forceSimple = true;
+
+            console.log(`📐 switchPosition: totalAfter=$${Number(totalValueAfterClose||0).toFixed(2)}, targetExposure=$${Number(targetExposure||0).toFixed(2)}, investedAfter=$${investedAfter.toFixed(2)}, requested=${desiredUsd.toFixed(2)}, final=${finalUsd.toFixed(2)}`);
 
             const ok = await this.portfolio.executeTrade(trade);
             if (ok) {
