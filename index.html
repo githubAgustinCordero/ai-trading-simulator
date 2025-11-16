@@ -2444,12 +2444,24 @@
 
             updatePositions() {
                 const positionsData = this.data.positions || {};
-                const open = positionsData.open || [];
+                let open = positionsData.open || [];
                 const market = this.data.market || {};
                 const currentPrice = market.price || 0;
                 const tableBody = document.getElementById('positionsTable');
 
                 if (!tableBody) return;
+
+                // Filter out extremely small exposures (e.g. $0.76 test trades) so the UI
+                // does not show negligible positions as "open". This avoids showing
+                // historical micro-trades as active positions when the canonical
+                // `positions.open` may include transient entries.
+                const MIN_DISPLAY_USD = 1.0;
+                open = (open || []).filter(p => {
+                    const entryUsd = (typeof p.entryUsd === 'number' && !isNaN(p.entryUsd)) ? Number(p.entryUsd) : null;
+                    const amount = Number(p.amountBtc || p.amount || 0) || 0;
+                    const notional = entryUsd !== null ? entryUsd : (amount * currentPrice);
+                    return (typeof notional === 'number' && notional >= MIN_DISPLAY_USD);
+                });
 
                 // Compute a stable hash of the open positions (we only need identity, not full content)
                 try {
