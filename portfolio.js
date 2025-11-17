@@ -60,6 +60,50 @@ class Portfolio {
         }
     }
 
+    // Reset portfolio to an initial balance and clear trades/open positions
+    async resetToInitial(initial = 10000) {
+        try {
+            this.initialBalance = Number(initial) || 10000;
+            this.balance = Number(this.initialBalance);
+            this.btcAmount = 0;
+            // Remove trades and open positions in memory
+            this.trades = [];
+            this.openPositions = [];
+
+            // Persist clean state to DB: delete trades and reset portfolio_state
+            try {
+                await this.runQuery('DELETE FROM trades');
+            } catch (e) {
+                console.warn('⚠️ Error limpiando tabla trades durante reset:', e && e.message ? e.message : e);
+            }
+
+            const state = {
+                balance: Number(this.balance),
+                btcAmount: 0,
+                initialBalance: Number(this.initialBalance),
+                totalValue: Number(this.initialBalance) || 0,
+                totalReturn: 0,
+                realizedPnL: 0,
+                unrealizedPnL: 0,
+                totalFees: 0,
+                maxDrawdown: 0,
+                sharpeRatio: 0
+            };
+
+            try {
+                await this.updatePortfolioState(state);
+            } catch (e) {
+                console.warn('⚠️ Error persistiendo estado inicial durante reset:', e && e.message ? e.message : e);
+            }
+
+            console.log(`🔄 Portfolio reseteado a $${this.initialBalance.toFixed(2)}`);
+            return true;
+        } catch (err) {
+            console.error('Error en resetToInitial:', err);
+            return false;
+        }
+    }
+
     // Cargar datos desde la base de datos
     async loadFromDatabase() {
         try {

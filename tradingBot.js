@@ -21,10 +21,21 @@ class TradingBot {
 
         // Sync and ensure at least one position exists
         try {
-            await this.syncCurrentPosition();
-            if (!this.currentPosition) {
-                await this.openInitialPosition();
+            // Reset simulation to baseline: initial balance $10,000
+            try {
+                if (this.portfolio && typeof this.portfolio.resetToInitial === 'function') {
+                    await this.portfolio.resetToInitial(10000);
+                }
+            } catch (e) {
+                console.warn('⚠️ No se pudo reiniciar portfolio a 10000:', e && e.message ? e.message : e);
             }
+
+            // Force simpleMode to bypass checks so bot always uses totalValue
+            if (this.portfolio) this.portfolio.simpleMode = true;
+
+            await this.syncCurrentPosition();
+            // Open initial position according to current signal
+            await this.openInitialPosition();
         } catch (err) {
             console.error('Error during start sync:', err && err.message ? err.message : err);
         }
@@ -86,24 +97,20 @@ class TradingBot {
             signals = { signal: 'HOLD', confidence: 0, indicators: {} };
         }
 
-        // Delegate decision making to the MAXI1 strategy module (protected)
+        // Simplified behavior: use signals.signal to decide LONG or SHORT
+        // and always invest the entire totalValue into that side. No complex
+        // sizing or available-cash logic — portfolio.simpleMode must be true.
         try {
-            const maxi1 = require('./strategies/maxi1');
-            if (!maxi1 || typeof maxi1.processSignals !== 'function') {
-                console.error('MAXI1 strategy module missing or invalid');
+            const sig = (signals.signal || 'HOLD').toUpperCase();
+            if (sig === 'BUY' || sig === 'SELL') {
+                const target = sig === 'BUY' ? 'long' : 'short';
+                await this.ensureFullPosition(target, marketData.price, signals.confidence || 100, signals);
             } else {
-                try {
-                    await maxi1.processSignals(this, signals, marketData);
-                } catch (strategyErr) {
-                    console.error('Error running MAXI1 strategy (caught):', strategyErr && strategyErr.message ? strategyErr.message : strategyErr);
-                }
+                // HOLD: do nothing
             }
         } catch (e) {
-            console.error('Error loading MAXI1 strategy module:', e && e.message ? e.message : e);
+            console.error('Error in simplified strategy execution:', e && e.message ? e.message : e);
         }
-
-        // Post-check for SL/TP or consistency (MAXI1 doesn't use SL/TP but keep hook)
-        await this.checkPositions(marketData.price);
     }
 
     // openInitialPosition: use stoch heuristic (delegated) or call portfolio rebuild
@@ -112,30 +119,93 @@ class TradingBot {
             const market = await this.marketData.getCurrentPrice();
             const signals = this.marketData.getMarketSignals() || {};
             if (!market) return;
-
-            // Prefer explicit signals from market data
-            const { safeNum } = require('./lib/utils');
-            const signal = signals.signal || 'HOLD';
-            const confidence = safeNum(signals.confidence, 80);
-
-            if (signal === 'BUY') {
-                await this.openLong(market.price, confidence, ['Posición inicial: BUY signal'], signals);
-                return;
-            }
-            if (signal === 'SELL') {
-                await this.openShort(market.price, confidence, ['Posición inicial: SELL signal'], signals);
-                return;
-            }
-
-            // Heuristic: use stoch 15m k < 50 -> LONG else SHORT
+            // Decide by explicit signal or fallback heuristic and ensure full exposure
+            const signal = (signals.signal || 'HOLD').toUpperCase();
+            const confidence = Number(signals.confidence || 100);
+            if (signal === 'BUY') return await this.ensureFullPosition('long', market.price, confidence, signals);
+            if (signal === 'SELL') return await this.ensureFullPosition('short', market.price, confidence, signals);
             const st15 = signals.indicators?.stoch?.['15m'] || {};
-            if (typeof st15.k === 'number' && st15.k < 50) {
-                await this.openLong(market.price, confidence, ['Posición inicial: heurística estocástico K<50'], signals);
-            } else {
-                await this.openShort(market.price, confidence, ['Posición inicial: heurística estocástico K>=50'], signals);
-            }
+            if (typeof st15.k === 'number' && st15.k < 50) return await this.ensureFullPosition('long', market.price, confidence, signals);
+            return await this.ensureFullPosition('short', market.price, confidence, signals);
         } catch (e) {
             console.error('Error opening initial position:', e && e.message ? e.message : e);
+        }
+    }
+
+    // Ensure only one position exists and it uses the entire totalValue
+    async ensureFullPosition(targetSide, price, confidence = 100, signals = {}) {
+        try {
+            // Force simple mode to bypass checks and allow full reinvest
+            if (this.portfolio) this.portfolio.simpleMode = true;
+
+            // Reload canonical state
+            try { if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') await this.portfolio.loadFromDatabase(); } catch(e){}
+            await this.syncCurrentPosition();
+
+            // If already in desired side, do nothing
+            if (this.currentPosition && this.currentPosition.side === targetSide) {
+                return true;
+            }
+
+            // If opposite position exists, attempt to close it (we ignore failures)
+            if (this.currentPosition && this.currentPosition.side && this.currentPosition.side !== targetSide) {
+                const opp = this.currentPosition.side;
+                const btcToClose = Number(this.currentPosition.amountBtc) || 0;
+                if (btcToClose > 0) {
+                    const closeTrade = opp === 'long' ? { type: 'SELL', amount: btcToClose, price, usdAmount: btcToClose * price, fee: 0, timestamp: new Date(), confidence, reasons: ['Auto-close before switch'], positionSide: 'long', action: 'close' }
+                        : { type: 'BUY', amount: btcToClose, price, usdAmount: btcToClose * price, fee: 0, timestamp: new Date(), confidence, reasons: ['Auto-close before switch'], positionSide: 'short', action: 'close' };
+                    try { await this.portfolio.executeTrade(closeTrade); } catch(e) { console.warn('⚠️ closeTrade failed but continuing:', e && e.message ? e.message : e); }
+                }
+                // Reload and sync
+                try { if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') await this.portfolio.loadFromDatabase(); } catch(e){}
+                await this.syncCurrentPosition();
+            }
+
+            // Compute totalValue (source of truth)
+            let totalValue = null;
+            try {
+                // Try DB state
+                if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getPortfolioState === 'function') {
+                    const dbState = await this.portfolio.db.getPortfolioState();
+                    if (dbState && typeof dbState.total_value === 'number') totalValue = Number(dbState.total_value);
+                }
+            } catch (e) {}
+            if (totalValue === null) {
+                try { totalValue = Number(this.portfolio.getTotalValue(price)) || Number(this.portfolio.initialBalance || 10000); } catch (e) { totalValue = Number(this.portfolio.initialBalance || 10000); }
+            }
+
+            // Build open trade that invests the entire totalValue
+            const usdAmount = Math.max(0, Number(totalValue || 0));
+            if (usdAmount <= 0) {
+                console.warn('No hay capital para abrir posición completa:', usdAmount);
+                return false;
+            }
+            const trade = {
+                type: targetSide === 'long' ? 'BUY' : 'SELL',
+                amount: usdAmount / price,
+                price: price,
+                usdAmount: usdAmount,
+                fee: 0,
+                timestamp: new Date(),
+                confidence: confidence,
+                reasons: ['FULL_INVEST: using totalValue'],
+                positionSide: targetSide,
+                action: 'open',
+                forceSimple: true
+            };
+
+            const ok = await this.portfolio.executeTrade(trade);
+            if (ok) {
+                this.lastTradeTime = Date.now();
+                this.currentPosition = { side: targetSide, amountBtc: trade.amount, entryPrice: price };
+                console.log(`✅ FULL ${targetSide.toUpperCase()} ABIERTO: $${usdAmount.toFixed(2)} -> ${(trade.amount).toFixed(8)} BTC @ $${price.toFixed(2)}`);
+                try { if (this.portfolio && typeof this.portfolio.loadFromDatabase === 'function') await this.portfolio.loadFromDatabase(); } catch(e){}
+                await this.syncCurrentPosition();
+            }
+            return ok;
+        } catch (e) {
+            console.error('Error en ensureFullPosition:', e && e.message ? e.message : e);
+            return false;
         }
     }
 
