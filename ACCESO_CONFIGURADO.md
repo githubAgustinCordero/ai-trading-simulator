@@ -67,7 +67,7 @@ curl "http://localhost:8080/api/status"
 netstat -tlnp | grep 8080
 
 # Inspeccionar base de datos
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old-old
 node inspect-db.js
 ```
 

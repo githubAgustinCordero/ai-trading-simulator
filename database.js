@@ -128,6 +128,7 @@ class DatabaseManager {
                 id INTEGER PRIMARY KEY,
                 max_position_size REAL DEFAULT 0.8,
                 stop_loss REAL DEFAULT 0.05,
+                stop_loss_usd REAL DEFAULT 100,
                 take_profit REAL DEFAULT 0.10,
                 min_confidence INTEGER DEFAULT 40,
                 cooldown_period INTEGER DEFAULT 300000,
@@ -232,10 +233,21 @@ class DatabaseManager {
         const config = await this.getBotConfig();
         if (!config) {
             await this.runQuery(`
-                INSERT INTO bot_config (id, max_position_size, stop_loss, take_profit, 
+                INSERT INTO bot_config (id, max_position_size, stop_loss, stop_loss_usd, take_profit, 
                     min_confidence, cooldown_period, risk_per_trade, max_consecutive_losses, is_active)
-                VALUES (1, 0.8, 0.05, 0.10, 40, 300000, 0.02, 3, 0)
+                VALUES (1, 0.8, 0.05, 100, 0.10, 40, 300000, 0.02, 3, 0)
             `);
+        }
+
+        // Ensure stoch_period exists in case older DB lacked the column
+        try {
+            const botConfigInfo = await this.getAllQuery("PRAGMA table_info(bot_config)");
+            const botConfigColumns = botConfigInfo.map(c => c.name);
+            if (!botConfigColumns.includes('stoch_period')) {
+                await this.runQuery(`ALTER TABLE bot_config ADD COLUMN stoch_period TEXT DEFAULT '15m'`);
+            }
+        } catch (e) {
+            // non-fatal
         }
 
         const portfolio = await this.getPortfolioState();
@@ -274,6 +286,14 @@ class DatabaseManager {
             if (!botConfigColumns.includes('trading_strategy')) {
                 console.log('Agregando columna trading_strategy a tabla bot_config');
                 await this.runQuery(`ALTER TABLE bot_config ADD COLUMN trading_strategy TEXT DEFAULT 'estocastico909'`);
+            }
+            if (!botConfigColumns.includes('stop_loss_usd')) {
+                console.log('Agregando columna stop_loss_usd a tabla bot_config');
+                await this.runQuery(`ALTER TABLE bot_config ADD COLUMN stop_loss_usd REAL DEFAULT 100`);
+            }
+            if (!botConfigColumns.includes('stoch_period')) {
+                console.log('Agregando columna stoch_period a tabla bot_config');
+                await this.runQuery(`ALTER TABLE bot_config ADD COLUMN stoch_period TEXT DEFAULT '15m'`);
             }
             
             // Agregar columnas que no existan
@@ -422,8 +442,18 @@ class DatabaseManager {
     // Guardar operación
     async saveTrade(trade) {
         try {
-            // Ensure amount is a valid number
-            trade.amount = Number(trade.amount) || 0;
+            // Ensure numeric fields are valid numbers (avoid Infinity/NaN being stored)
+            const toNumberSafe = (v, fallback = 0) => {
+                const n = Number(v);
+                return Number.isFinite(n) ? n : fallback;
+            };
+
+            trade.amount = toNumberSafe(trade.amount, 0);
+            trade.price = toNumberSafe(trade.price, 0);
+            trade.usdAmount = toNumberSafe(trade.usdAmount ?? trade.usd_amount, 0);
+            trade.fee = toNumberSafe(trade.fee, 0);
+            trade.balanceAfter = toNumberSafe(trade.balanceAfter ?? trade.balance_after, 0);
+            trade.btcAfter = toNumberSafe(trade.btcAfter ?? trade.btc_after, 0);
 
             // Defensive: ensure position_id exists for open trades.
             // Some codepaths previously saved trades without a position_id which
@@ -440,6 +470,28 @@ class DatabaseManager {
                 // Attach back to trade object in both common variants so callers/readers see it
                 trade.positionId = positionId;
                 trade.position_id = positionId;
+            }
+
+            // Prevent inserting duplicate CLOSE records for the same position_id.
+            // Historically multiple processes or race conditions could create
+            // two 'close' rows for one position; detect an existing close and
+            // skip the insert to keep the ledger consistent.
+            if (action === 'close' && positionId) {
+                try {
+                    const existingClose = await this.getQuery(
+                        "SELECT trade_id FROM trades WHERE action = 'close' AND position_id = ? LIMIT 1",
+                        [positionId]
+                    ).catch(() => null);
+                    if (existingClose && existingClose.trade_id) {
+                        console.warn(`Duplicate close detected for position_id=${positionId} (existing trade_id=${existingClose.trade_id}). Skipping insert.`);
+                        try { await this.addLog('warning', `Duplicate close skipped for position_id=${positionId}`, 'database', { tradeId: trade.id, existingTradeId: existingClose.trade_id }); } catch(e){}
+                        return { skipped: true };
+                    }
+                } catch (e) {
+                    // If the check fails for any reason, proceed with the insert
+                    // to avoid blocking normal operation — but log the error.
+                    console.warn('Error checking duplicate close:', e && e.message ? e.message : e);
+                }
             }
             const sql = `
                 INSERT INTO trades (trade_id, type, amount, price, usd_amount, fee,

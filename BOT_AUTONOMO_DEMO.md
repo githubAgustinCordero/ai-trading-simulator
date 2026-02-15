@@ -65,7 +65,7 @@ async executeStrategy() {
 
 #### 📊 **Inspección de Base de Datos** (sin abrir dashboard):
 ```bash
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old-old
 node inspect-db.js
 ```
 

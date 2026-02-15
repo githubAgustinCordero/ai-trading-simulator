@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Minimal safe monitor runner (temporary)
-BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
 ALERT_LOG="$BASE_DIR/monitor/alerts.log"
 mkdir -p "$BASE_DIR/monitor"
 echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') MONITOR: heartbeat" >> "$ALERT_LOG"
@@ -12,7 +12,7 @@ exit 0
 # - scans journalctl for repeated duplicate-open warnings
 # - logs alerts to monitor/alerts.log and optionally POSTs to $ALERT_WEBHOOK
 
-BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
 API_URL="http://localhost:8080/api/status"
 DB_PATH="$BASE_DIR/trading_simulator_agustin.db"
 ALERT_LOG="$BASE_DIR/monitor/alerts.log"
@@ -35,7 +35,7 @@ log_alert() {
   # - scans journalctl for repeated duplicate-open warnings
   # - logs alerts to monitor/alerts.log and optionally POSTs to $ALERT_WEBHOOK
 
-  BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+  BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
   API_URL="http://localhost:8080/api/status"
   DB_PATH="$BASE_DIR/trading_simulator_agustin.db"
   ALERT_LOG="$BASE_DIR/monitor/alerts.log"
@@ -57,7 +57,7 @@ log_alert() {
     # - scans journalctl for repeated duplicate-open warnings
     # - logs alerts to monitor/alerts.log and optionally POSTs to $ALERT_WEBHOOK
 
-    BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+    BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
     API_URL="http://localhost:8080/api/status"
     DB_PATH="$BASE_DIR/trading_simulator_agustin.db"
     ALERT_LOG="$BASE_DIR/monitor/alerts.log"
@@ -81,7 +81,7 @@ log_alert() {
       # - scans journalctl for repeated duplicate-open warnings
       # - logs alerts to monitor/alerts.log and optionally POSTs to $ALERT_WEBHOOK
 
-      BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+      BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
       API_URL="http://localhost:8080/api/status"
       DB_PATH="$BASE_DIR/trading_simulator_agustin.db"
       ALERT_LOG="$BASE_DIR/monitor/alerts.log"
@@ -105,7 +105,7 @@ log_alert() {
         # - scans journalctl for repeated duplicate-open warnings
         # - logs alerts to monitor/alerts.log and optionally POSTs to $ALERT_WEBHOOK
 
-        BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+        BASE_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old"
         API_URL="http://localhost:8080/api/status"
         DB_PATH="$BASE_DIR/trading_simulator_agustin.db"
         ALERT_LOG="$BASE_DIR/monitor/alerts.log"

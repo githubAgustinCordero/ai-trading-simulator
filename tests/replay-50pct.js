@@ -56,8 +56,9 @@
 
   // According to your rule: sum result to remaining cash (balance already reflects it)
   const newCash = Number(p.balance || 0);
-  const openNextUsd = Math.floor((newCash * 0.5) * 100) / 100; // 50% of new cash, rounded to cents
-  console.log('\n--- After close, newCash=', newCash.toFixed(2), ', will use 50%=', openNextUsd.toFixed(2));
+  // Under the new rule we invest the full available cash/new total
+  const openNextUsd = Math.floor((newCash * 1.0) * 100) / 100; // 100% of new cash, rounded to cents
+  console.log('\n--- After close, newCash=', newCash.toFixed(2), ', will use 100%=', openNextUsd.toFixed(2));
 
   // Open LONG with 50% of new cash
   const longPrice = closePrice; // assume same market price for opening

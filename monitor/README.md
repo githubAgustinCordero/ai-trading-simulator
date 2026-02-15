@@ -14,13 +14,13 @@ Alertas:
 
 Ejecución manual:
 ```bash
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old
 ./monitor/monitor_alerts.sh
 ```
 
 Ejecutarlo periódicamente (ejemplo cron cada 1 minuto):
 ```cron
-* * * * * cd /var/www/agubot.ddns.net/ai-trading-simulator && ./monitor/monitor_alerts.sh >/dev/null 2>&1
+* * * * * cd /var/www/agubot.ddns.net/ai-trading-simulator-old && ./monitor/monitor_alerts.sh >/dev/null 2>&1
 ```
 
 Ejemplo systemd unit (opcional): copiar `monitor/ai-trading-monitor.service.sample` a `/etc/systemd/system/ai-trading-monitor.service`, editar y `systemctl enable --now ai-trading-monitor`.

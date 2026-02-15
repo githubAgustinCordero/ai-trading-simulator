@@ -83,25 +83,25 @@ case $choice in
         ;;
     2)
         echo -e "${GREEN}▶️ Iniciando bot de trading...${NC}"
-        cd /var/www/agubot.ddns.net/ai-trading-simulator && ./manage.sh start
+        cd /var/www/agubot.ddns.net/ai-trading-simulator-old && ./manage.sh start
         ;;
     3)
         echo -e "${YELLOW}⏹️ Deteniendo bot de trading...${NC}"
-        cd /var/www/agubot.ddns.net/ai-trading-simulator && ./manage.sh stop
+        cd /var/www/agubot.ddns.net/ai-trading-simulator-old && ./manage.sh stop
         ;;
     4)
         echo -e "${BLUE}📊 Estado detallado del sistema:${NC}"
-        cd /var/www/agubot.ddns.net/ai-trading-simulator && ./manage.sh status
+        cd /var/www/agubot.ddns.net/ai-trading-simulator-old && ./manage.sh status
         ;;
     5)
         echo -e "${CYAN}📋 Logs en tiempo real (Ctrl+C para salir):${NC}"
-        cd /var/www/agubot.ddns.net/ai-trading-simulator && ./manage.sh logs
+        cd /var/www/agubot.ddns.net/ai-trading-simulator-old && ./manage.sh logs
         ;;
     6)
         echo -e "${YELLOW}🔄 Reiniciando sistema...${NC}"
         read -p "$(echo -e ${RED}¿Estás seguro? Esto borrará el historial [y/N]:${NC} )" confirm
         if [[ $confirm =~ ^[Yy]$ ]]; then
-            cd /var/www/agubot.ddns.net/ai-trading-simulator
+            cd /var/www/agubot.ddns.net/ai-trading-simulator-old
             curl -X POST http://localhost:3001/api/bot/reset
             echo -e "${GREEN}✅ Sistema reiniciado${NC}"
         else

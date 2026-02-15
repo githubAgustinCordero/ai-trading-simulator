@@ -39,7 +39,7 @@ El **AI Trading Simulator** es un simulador de trading automático que utiliza i
 - Botón "🔄 Reiniciar" (borra todo el historial)
 
 # Terminal (avanzado)
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old-old
 ./manage.sh start    # Iniciar bot
 ./manage.sh stop     # Detener bot
 ./manage.sh restart  # Reiniciar

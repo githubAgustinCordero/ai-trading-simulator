@@ -2,7 +2,7 @@
 
 echo "🚀 Iniciando simulación directa..."
 
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old
 
 # Iniciar servidor
 echo "📡 Iniciando servidor..."

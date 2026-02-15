@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-WorkingDirectory=/var/www/agubot.ddns.net/ai-trading-simulator
+User=agustin
+WorkingDirectory=/var/www/agubot.ddns.net/ai-trading-simulator-old
 Environment=NODE_ENV=production
-Environment=PORT=8080
+Environment=PORT=9999
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=10
@@ -21,7 +21,7 @@ SyslogIdentifier=ai-trading-simulator
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/www/agubot.ddns.net/ai-trading-simulator
+ReadWritePaths=/var/www/agubot.ddns.net/ai-trading-simulator-old
 
 [Install]
 WantedBy=multi-user.target

@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/var/www/agubot.ddns.net/ai-trading-simulator
-ExecStart=/bin/bash /var/www/agubot.ddns.net/ai-trading-simulator/monitor/monitor_alerts.sh
+WorkingDirectory=/var/www/agubot.ddns.net/ai-trading-simulator-old
+ExecStart=/bin/bash /var/www/agubot.ddns.net/ai-trading-simulator-old/monitor/monitor_alerts.sh
 User=agustin
 Restart=on-failure
 

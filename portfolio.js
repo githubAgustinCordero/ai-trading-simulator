@@ -4,6 +4,10 @@ class Portfolio {
     constructor(initialBalance = 10000) {
         this.db = new DatabaseManager();
         this.initialBalance = initialBalance;
+        // Optional reference to the server's marketData instance. When set,
+        // portfolio will prefer it for price queries to ensure persistence
+        // uses the same canonical price as the server broadcast.
+        this.marketData = null;
         
         // Estado actual (se carga desde BD)
         this.balance = initialBalance;
@@ -60,6 +64,12 @@ class Portfolio {
         }
     }
 
+    // Allow external injection of the canonical marketData provider used by the server
+    // so that Portfolio can use exactly the same price when persisting state.
+    setMarketData(marketData) {
+        this.marketData = marketData;
+    }
+
     // Reset portfolio to an initial balance and clear trades/open positions
     async resetToInitial(initial = 10000) {
         try {
@@ -72,7 +82,7 @@ class Portfolio {
 
             // Persist clean state to DB: delete trades and reset portfolio_state
             try {
-                await this.runQuery('DELETE FROM trades');
+                await this.db.runQuery('DELETE FROM trades');
             } catch (e) {
                 console.warn('⚠️ Error limpiando tabla trades durante reset:', e && e.message ? e.message : e);
             }
@@ -91,7 +101,7 @@ class Portfolio {
             };
 
             try {
-                await this.updatePortfolioState(state);
+                await this.db.updatePortfolioState(state);
             } catch (e) {
                 console.warn('⚠️ Error persistiendo estado inicial durante reset:', e && e.message ? e.message : e);
             }
@@ -179,16 +189,42 @@ class Portfolio {
                 if (!pid || !closesBySide[side].has(pid)) {
                     const posId = pid || (`${side}_${o.trade_id || o.id || Date.now()}`);
                     console.log(`🔄 [REBUILD] Agregando ${side.toUpperCase()} abierto: ${posId}`);
-                    this.openPositions.push({
-                        id: posId,
-                        side: side,
-                        amountBtc: Number(o.amount) || Number(o.amountBtc) || 0,
-                        entryPrice: Number(o.price) || Number(o.entryPrice) || 0,
-                        stopLoss: o.stop_loss || o.stopLoss || null,
-                        takeProfit: o.take_profit || o.takeProfit || null,
-                        entryUsd: Number(o.usd_amount || o.usdAmount || o.entryUsd || 0) || 0,
-                        timestamp: o.timestamp ? new Date(o.timestamp) : new Date()
-                    });
+                    // Normalize incoming open trade fields and avoid zero prices
+                    const lastKnown = this.getLastKnownPrice() || 1;
+                    const rawAmount = Number(o.amount) || Number(o.amountBtc) || 0;
+                    let rawEntryPrice = Number(o.price) || Number(o.entryPrice) || 0;
+                    const rawEntryUsd = Number(o.usd_amount || o.usdAmount || o.entryUsd || 0) || 0;
+
+                    // If entry price is missing or zero, try to derive it from entryUsd/amount or fallback to lastKnown
+                    if (!rawEntryPrice || rawEntryPrice <= 0) {
+                        if (rawEntryUsd > 0 && rawAmount > 0) {
+                            rawEntryPrice = rawEntryUsd / rawAmount;
+                        } else {
+                            rawEntryPrice = lastKnown;
+                        }
+                    }
+
+                    // If amount is missing but we have entryUsd and entryPrice, derive amount
+                    let finalAmount = rawAmount;
+                    if ((!finalAmount || finalAmount <= 0) && rawEntryUsd > 0 && rawEntryPrice > 0) {
+                        finalAmount = rawEntryUsd / rawEntryPrice;
+                    }
+
+                    // Only add positions that make sense (non-zero amount and price)
+                    if (finalAmount > 0 && rawEntryPrice > 0) {
+                        this.openPositions.push({
+                            id: posId,
+                            side: side,
+                            amountBtc: Number(finalAmount) || 0,
+                            entryPrice: Number(rawEntryPrice) || lastKnown,
+                            stopLoss: o.stop_loss || o.stopLoss || null,
+                            takeProfit: o.take_profit || o.takeProfit || null,
+                            entryUsd: Number(rawEntryUsd) > 0 ? Number(rawEntryUsd) : Number(finalAmount) * Number(rawEntryPrice),
+                            timestamp: o.timestamp ? new Date(o.timestamp) : new Date()
+                        });
+                    } else {
+                        console.log(`⚠️ Ignorando posición abierta inválida durante rebuild: posId=${posId}, rawAmount=${rawAmount}, rawEntryPrice=${rawEntryPrice}, rawEntryUsd=${rawEntryUsd}`);
+                    }
                 } else {
                     console.log(`🔄 [REBUILD] ${side.toUpperCase()} ya cerrado: ${pid}`);
                 }
@@ -207,6 +243,22 @@ class Portfolio {
         }
 
         // Nota: no forzamos cambios al balance desde rebuild; el balance es la fuente de verdad en portfolio_state
+        // Enforce global limit of open positions (default 1)
+        try {
+            const maxOpen = Number(process.env.MAX_OPEN_POSITIONS || 1);
+            if (Array.isArray(this.openPositions) && this.openPositions.length > maxOpen) {
+                // Keep the most recent positions by timestamp
+                this.openPositions.sort((a, b) => {
+                    const ta = a && a.timestamp ? new Date(a.timestamp).getTime() : 0;
+                    const tb = b && b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                    return tb - ta;
+                });
+                this.openPositions = this.openPositions.slice(0, maxOpen);
+                console.log(`🔒 Limite de posiciones abiertas alcanzado. Manteniendo las ${maxOpen} más recientes.`);
+            }
+        } catch (e) {
+            console.warn('⚠️ Error aplicando límite de posiciones abiertas en rebuild:', e && e.message ? e.message : e);
+        }
     }
 
     // Guardar estado en base de datos
@@ -279,8 +331,17 @@ class Portfolio {
                 }
                 return false;
             } catch (error) {
-                console.error('Error ejecutando operación:', error);
-                try { await this.db.addLog('error', `Error ejecutando operación: ${error.message}`, 'portfolio'); } catch(e){}
+                // Mejor manejo de errores para evitar mensajes con variables indefinidas
+                const emsg = (error && error.message) ? error.message : String(error);
+                if (/entryUsd\b/.test(emsg)) {
+                    console.error('Error ejecutando operación: referencia indefinida detectada (entryUsd).', emsg);
+                    try {
+                        await this.db.addLog('error', `Error ejecutando operación: referencia indefinida (entryUsd). trade=${JSON.stringify(trade||{})}`, 'portfolio');
+                    } catch (e) {}
+                } else {
+                    console.error('Error ejecutando operación:', error);
+                    try { await this.db.addLog('error', `Error ejecutando operación: ${emsg}`, 'portfolio'); } catch(e){}
+                }
                 return false;
             }
         });
@@ -502,9 +563,68 @@ class Portfolio {
 
         // Nuevo comportamiento: la apertura de SHORT consume fondos disponibles (no acredita dinero)
         // Se requiere disponer de usdAmount + fee en balance
+        // Limitar a UNA posición abierta globalmente: si ya existe cualquiera, intentar auto-cerrar
+        // si es pequeña; si no, bloquear la apertura.
+        try {
+            const maxOpen = Number(process.env.MAX_OPEN_POSITIONS || 1);
+            if (Array.isArray(this.openPositions) && this.openPositions.length >= maxOpen) {
+                // Si la posición existente es pequeña, intentamos auto-cerrar para permitir nueva apertura
+                const existingPos = this.openPositions[0];
+                const smallThreshold = Number(process.env.SMALL_POSITION_USD || 100);
+                const posUsd = Number(existingPos?.entryUsd || (existingPos?.amountBtc || 0) * (existingPos?.entryPrice || trade.price || 0) || 0);
+                if (posUsd > 0 && posUsd < smallThreshold) {
+                    console.log(`⚠️ Existe 1 posición abierta pequeña (USD $${posUsd.toFixed(2)}) — intentando auto-cierre antes de abrir SHORT.`);
+                    const closeTrade = {
+                        type: 'BUY',
+                        amount: existingPos.amountBtc || 0,
+                        price: trade.price || (await this.getCurrentBtcPrice()),
+                        usdAmount: (existingPos.amountBtc || 0) * (trade.price || await this.getCurrentBtcPrice()),
+                        fee: 0,
+                        timestamp: new Date(),
+                        confidence: 0,
+                        reasons: ['AUTO_RECOVER_CLOSE_SMALL_EXISTING'],
+                        positionSide: existingPos.side,
+                        action: 'close'
+                    };
+                    const closedOk = await this.executeTrade(closeTrade);
+                    if (!closedOk) {
+                        const msg = 'Auto-cierre de posición pequeña falló — abortando apertura SHORT para mantener única posición.';
+                        console.log('❌ ' + msg);
+                        try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e){}
+                        return false;
+                    }
+                } else {
+                    const msg = 'Ya existe una posición abierta. Solo se permite una posición a la vez.';
+                    console.log('⚠️ ' + msg);
+                    try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e){}
+                    return false;
+                }
+            }
+        } catch (e) {
+            console.warn('⚠️ Error comprobando límite de posiciones abiertas:', e && e.message ? e.message : e);
+        }
         trade.amount = Number(trade.amount) || 0;
         trade.usdAmount = Number(trade.usdAmount) || 0;
         const feeAmount = Number(trade.fee || 0);
+
+        // Sanitizar precio para evitar divisiones por cero/infinito
+        if (!trade.price || !Number.isFinite(Number(trade.price)) || Number(trade.price) <= 0) {
+            const fallback = this.getLastKnownPrice() || 0;
+            if (fallback > 0) {
+                console.log(`⚠️ trade.price inválido para OPEN SHORT; usando precio conocido reciente ${fallback}`);
+                trade.price = Number(fallback);
+            } else {
+                console.log('⚠️ trade.price inválido y no hay precio conocido; abortando apertura para evitar cantidades infinitas');
+                await this.db.addLog('warning', 'Abortando apertura SHORT por trade.price inválido (0) y sin fallback', 'portfolio');
+                return false;
+            }
+        }
+
+        // Recalcular amount de forma segura
+        if (!trade.amount || trade.amount <= 0) {
+            const computed = Number(trade.usdAmount) / Number(trade.price || 1);
+            trade.amount = (Number.isFinite(computed) && computed > 0) ? computed : 0;
+        }
 
         // Enforce: clamp requested usdAmount to available balance (portfolio-side enforcement)
         try {
@@ -616,35 +736,29 @@ class Portfolio {
         const feeClose = Number(trade.fee || 0);
         const cost = Number(costToBuyBack || 0) + feeClose;
 
-        // entryUsd fue consumido al abrir; consideramos que el disponible para cerrar
-        // es el balance en memoria más el entryUsd reservado para la posición.
-        const entryUsd = Number(pos.entryUsd || (pos.amountBtc * pos.entryPrice)) || 0;
-        const availableForClose = Number(this.balance || 0) + entryUsd;
+        // Nuevo criterio simplificado: usar solo `totalValue` para decidir si cubrir el cierre.
+        const totalValueAtExit = this.getTotalValue(exitPrice);
 
-        // Log diagnóstico mínimo para ayudar a depurar diferencias pequeñas
-        console.log(`📣 executeShortClose: balance=${this.balance.toFixed(2)}, entryUsd=${entryUsd.toFixed(2)}, availableForClose=${availableForClose.toFixed(2)}, costToBuyBack=${costToBuyBack.toFixed(2)}, feeClose=${feeClose.toFixed(2)}, totalCost=${cost.toFixed(2)}, posId=${pos.id}`);
-        try { await this.db.addLog('debug', `executeShortClose: balance=${this.balance.toFixed(2)}, entryUsd=${entryUsd.toFixed(2)}, availableForClose=${availableForClose.toFixed(2)}, totalCost=${cost.toFixed(2)}, posId=${pos.id}`,'portfolio'); } catch(e) {}
+        // Log diagnóstico simplificado
+        console.log(`📣 executeShortClose: totalValueAtExit=$${totalValueAtExit.toFixed(2)}, costToBuyBack=$${costToBuyBack.toFixed(2)}, feeClose=$${feeClose.toFixed(2)}, totalCost=$${cost.toFixed(2)}, posId=${pos.id}`);
+        try { await this.db.addLog('debug', `executeShortClose: totalValueAtExit=${totalValueAtExit.toFixed(2)}, totalCost=${cost.toFixed(2)}, posId=${pos.id}`,'portfolio'); } catch(e) {}
 
-        if (availableForClose < cost) {
-            // Diagnostic: include more context to help debug why availableForClose is low
-            const totalValueAtExit = this.getTotalValue(exitPrice);
+        if (totalValueAtExit < cost) {
             const diagnostic = {
-                balance: Number(this.balance || 0),
-                entryUsd: Number(entryUsd || 0),
-                availableForClose: Number(availableForClose || 0),
+                totalValueAtExit: Number(totalValueAtExit || 0),
                 costToBuyBack: Number(costToBuyBack || 0),
                 feeClose: Number(feeClose || 0),
                 totalCost: Number(cost || 0),
-                totalValueAtExit: Number(totalValueAtExit || 0),
                 btcAmount: Number(this.btcAmount || 0),
                 openPositionsCount: this.openPositions.length
             };
-            const message = `Balance insuficiente para cerrar short: disponible=$${availableForClose.toFixed(2)} < costo_total=$${cost.toFixed(2)} — se procederá al cierre y se aplicará el resultado de la operación al balance.`;
-            console.warn('⚠️ ' + message);
+            const message = `Valor total insuficiente para cerrar short: totalValue=$${totalValueAtExit.toFixed(2)} < costo_total=$${cost.toFixed(2)}`;
+            console.log('❌ ' + message);
             console.log('⚠️ Diagnostic snapshot for insufficient-close:', diagnostic);
             try { await this.db.addLog('warning', `${message} | diagnostic=${JSON.stringify(diagnostic)}`, 'portfolio'); } catch(e) {}
-            // Según la política de la estrategia, siempre cerramos la posición y usamos el dinero resultante
-            // para la siguiente inversión; por tanto no retornamos false aquí.
+
+            // Abortamos el cierre cuando el criterio de totalValue no alcanza para cubrir el coste.
+            return false;
         }
 
         // Actualizar balance en un solo paso para evitar doble contabilidad:
@@ -762,6 +876,46 @@ class Portfolio {
             // Si la comprobación falla, no bloqueamos la apertura; continuar para evitar bloqueo accidental
         }
 
+        // Limitar a UNA posición abierta globalmente: si ya existe cualquiera, intentar auto-cerrar
+        // si es pequeña; si no, bloquear la apertura.
+        try {
+            const maxOpen = Number(process.env.MAX_OPEN_POSITIONS || 1);
+            if (Array.isArray(this.openPositions) && this.openPositions.length >= maxOpen) {
+                const existingPos = this.openPositions[0];
+                const smallThreshold = Number(process.env.SMALL_POSITION_USD || 100);
+                const posUsd = Number(existingPos?.entryUsd || (existingPos?.amountBtc || 0) * (existingPos?.entryPrice || trade.price || 0) || 0);
+                if (posUsd > 0 && posUsd < smallThreshold) {
+                    console.log(`⚠️ Existe 1 posición abierta pequeña (USD $${posUsd.toFixed(2)}) — intentando auto-cierre antes de abrir LONG.`);
+                    const closeTrade = {
+                        type: 'SELL',
+                        amount: existingPos.amountBtc || 0,
+                        price: trade.price || (await this.getCurrentBtcPrice()),
+                        usdAmount: (existingPos.amountBtc || 0) * (trade.price || await this.getCurrentBtcPrice()),
+                        fee: 0,
+                        timestamp: new Date(),
+                        confidence: 0,
+                        reasons: ['AUTO_RECOVER_CLOSE_SMALL_EXISTING'],
+                        positionSide: existingPos.side,
+                        action: 'close'
+                    };
+                    const closedOk = await this.executeTrade(closeTrade);
+                    if (!closedOk) {
+                        const msg = 'Auto-cierre de posición pequeña falló — abortando apertura LONG para mantener única posición.';
+                        console.log('❌ ' + msg);
+                        try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e){}
+                        return false;
+                    }
+                } else {
+                    const msg = 'Ya existe una posición abierta. Solo se permite una posición a la vez.';
+                    console.log('⚠️ ' + msg);
+                    try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e){}
+                    return false;
+                }
+            }
+        } catch (e) {
+            console.warn('⚠️ Error comprobando límite de posiciones abiertas:', e && e.message ? e.message : e);
+        }
+
         // Diagnostic: snapshot requested USD and balance before any adjustment
         const requestedUsdOrigLong = Number(trade.usdAmount || 0);
         const balanceSnapshotLong = Number(this.balance || 0);
@@ -774,44 +928,60 @@ class Portfolio {
 
         const feeAmount = Number(trade.fee || 0);
 
-        // Enforce: clamp requested usdAmount to available balance (portfolio-side enforcement)
+        // Nuevo comportamiento: usar `totalValue` como referencia única para sizing
+        // `totalCost` se declara en ámbito exterior porque se usa fuera del try/catch
+        let totalCost = 0;
         try {
             trade.usdAmount = Number(trade.usdAmount) || 0;
             trade.amount = Number(trade.amount) || 0;
-            // Respect SIMPLE MODE: skip clamp when portfolio is in simpleMode or trade.forceSimple is set
+
+            // Sanitizar precio de entrada: evitar price <= 0
+            if (!trade.price || !Number.isFinite(Number(trade.price)) || Number(trade.price) <= 0) {
+                const fallback = this.getLastKnownPrice() || 0;
+                if (fallback > 0) {
+                    console.log(`⚠️ trade.price inválido para OPEN LONG; usando precio conocido reciente ${fallback}`);
+                    trade.price = Number(fallback);
+                } else {
+                    console.log('⚠️ trade.price inválido y no hay precio conocido; abortando apertura LONG para evitar cantidades infinitas');
+                    await this.db.addLog('warning', 'Abortando apertura LONG por trade.price inválido (0) y sin fallback', 'portfolio');
+                    return false;
+                }
+            }
+
+            // Calcular `totalValue` en el momento de la apertura
+            const totalValueAtOpen = this.getTotalValue(trade.price);
+
+            // Si no se fuerza simple, normalizar usdAmount usando totalValue.
             if (!trade.forceSimple && !this.simpleMode) {
-                const available = Number(this.balance || 0);
-                if (trade.usdAmount + feeAmount > available) {
-                    const prev = trade.usdAmount + feeAmount;
-                    trade.usdAmount = Math.max(0, available - feeAmount);
-                    trade.amount = trade.price > 0 ? Number(trade.usdAmount) / Number(trade.price) : 0;
-                    const msg = `⚠️ Ajustado usdAmount para OPEN LONG: antes=${prev.toFixed(2)}, ahora=${(trade.usdAmount+feeAmount).toFixed(2)} (usdAmount=${trade.usdAmount.toFixed(2)}, fee=${feeAmount.toFixed(2)})`;
-                    console.log(msg);
-                    try { await this.db.addLog('warning', msg, 'portfolio'); } catch(e) {}
+                if (trade.usdAmount <= 0) {
+                    // Si no se especificó, asumimos que se quiere invertir todo el totalValue
+                    trade.usdAmount = totalValueAtOpen;
+                } else {
+                    // No invertir más que el totalValue
+                    trade.usdAmount = Math.min(trade.usdAmount, totalValueAtOpen);
+                }
+            } else {
+                // En SIMPLE MODE permitimos la usdAmount tal cual (posible negative/overcommit in simulations)
+                trade.usdAmount = Number(trade.usdAmount) || 0;
+            }
+
+            // Audit
+            try { if (this.db && typeof this.db.addTradeAudit === 'function') { await this.db.addTradeAudit({ tradeId: trade.id || null, requestedUsd: requestedUsdOrigLong, finalUsd: trade.usdAmount, totalValueAtOpen }, ); } } catch (e) {}
+
+            totalCost = trade.usdAmount + feeAmount;
+
+            // Requerir que el totalValue cubra el coste (salvo forceSimple/simpleMode)
+            if (!trade.forceSimple && !this.simpleMode) {
+                if (totalValueAtOpen < totalCost || trade.usdAmount <= 0) {
+                    const message = `Valor total insuficiente para abrir long: totalValue=$${totalValueAtOpen.toFixed(2)} < costo_total=$${totalCost.toFixed(2)}`;
+                    console.log('❌ ' + message);
+                    try { await this.db.addLog('warning', message, 'portfolio'); } catch(e) {}
+                    return false;
                 }
             }
         } catch (e) {
-            console.warn('⚠️ Error calculando clamp de usdAmount para long:', e && e.message ? e.message : e);
-        }
-
-            // Audit the attempt (requested vs final)
-            try {
-                if (this.db && typeof this.db.addTradeAudit === 'function') {
-                    await this.db.addTradeAudit({ tradeId: trade.id || null, requestedUsd: requestedUsdOrigLong, finalUsd: trade.usdAmount, balanceSnapshot: balanceSnapshotLong, note: 'OPEN LONG attempt' });
-                }
-            } catch (e) {}
-
-        const totalCost = trade.usdAmount + feeAmount;
-
-        // Verificar si tenemos suficiente balance después del ajuste (o forzar apertura en SIMPLE MODE)
-        // Require sufficient cash only when not in simpleMode and not forcing simple on this trade
-        if (!trade.forceSimple && !this.simpleMode) {
-            if (this.balance < totalCost || trade.usdAmount <= 0) {
-                const message = `Balance insuficiente para abrir long tras ajuste: $${this.balance.toFixed(2)} < $${totalCost.toFixed(2)}`;
-                console.log('❌ ' + message);
-                await this.db.addLog('warning', message, 'portfolio');
-                return false;
-            }
+            console.warn('⚠️ Error procesando usdAmount/totalValue para OPEN LONG:', e && e.message ? e.message : e);
+            return false;
         }
 
         // Debitar el importe usado para la apertura (se considera reservado/consumido)
@@ -1002,14 +1172,29 @@ class Portfolio {
         return `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     }
 
+    // Obtener un precio conocido reciente a partir de las trades en memoria
+    getLastKnownPrice() {
+        try {
+            if (!this.trades || this.trades.length === 0) return 0;
+            for (const t of this.trades) {
+                const p = Number(t.price || t.exit_price || t.entry_price || 0);
+                if (p && Number.isFinite(p) && p > 0) return p;
+            }
+            return 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
     // Obtener valor total del portafolio
     getTotalValue(currentBtcPrice = 0) {
-        // Nuevo cálculo: el valor total se considera como el capital inicial más PnL realizado y no realizado
-        // Esto evita que la apertura de un SHORT (que acredita efectivo) haga subir artificialmente el "totalValue".
-        const realized = this.calculateRealizedPnL();
+        // Consistent definition:
+        // totalValue = current cash balance + unrealized PnL of open positions
+        // Rationale: balance already reflects realized PnL and cash movements (including reserves
+        // used to open positions). Adding unrealized PnL yields the up-to-date portfolio value
+        // without double-counting initialBalance or realized PnL.
         const unrealized = this.getUnrealizedPnL(currentBtcPrice);
-
-        const totalValue = (Number(this.initialBalance) || 0) + (Number(realized) || 0) + (Number(unrealized) || 0);
+        const totalValue = (Number(this.balance) || 0) + (Number(unrealized) || 0);
         return totalValue;
     }
 
@@ -1057,25 +1242,57 @@ class Portfolio {
 
     // Calcular PnL realizado
     calculateRealizedPnL() {
-        let realizedPnL = 0;
-        const sellTrades = this.trades.filter(t => t.type === 'SELL');
-        
-        for (const sell of sellTrades) {
-            // Buscar compras correspondientes (FIFO)
-            const buyTrades = this.trades.filter(t => 
-                t.type === 'BUY' && 
-                new Date(t.timestamp) < new Date(sell.timestamp)
-            );
-            
-            if (buyTrades.length > 0) {
-                const avgBuyPrice = buyTrades.reduce((sum, trade) => sum + (trade.price * trade.amount), 0) / 
-                                 buyTrades.reduce((sum, trade) => sum + trade.amount, 0);
-                
-                realizedPnL += (sell.price - avgBuyPrice) * sell.amount;
+        // Recompute realized PnL by pairing opens and closes using position_id.
+        // For each position that has both an open and a close trade, compute:
+        // - long: pnl = close.usd_amount - open.usd_amount
+        // - short: pnl = open.usd_amount - close.usd_amount
+        try {
+            let realizedPnL = 0;
+
+            // Build map of positions -> { open, close }
+            const positions = {};
+            for (const t of this.trades) {
+                const pid = t.position_id || t.positionId || t.positionId || null;
+                if (!pid) continue;
+                const action = (t.action || '').toString().toLowerCase();
+                if (!positions[pid]) positions[pid] = { open: null, close: null, side: t.position_side || t.positionSide || null };
+                if (action === 'open') positions[pid].open = t;
+                if (action === 'close') positions[pid].close = t;
+                if (!positions[pid].side && (t.position_side || t.positionSide)) positions[pid].side = t.position_side || t.positionSide;
             }
+
+            // Sum pnl for closed positions only
+            for (const pid of Object.keys(positions)) {
+                const p = positions[pid];
+                if (!p.open || !p.close) continue; // only closed positions
+
+                const openUsd = Number(p.open.usd_amount || p.open.usdAmount || p.open.entryUsd || 0) || 0;
+                const closeUsd = Number(p.close.usd_amount || p.close.usdAmount || p.close.exitUsd || 0) || 0;
+                const side = (p.side || (p.open && p.open.position_side) || '').toString().toLowerCase();
+
+                if (side === 'short') {
+                    realizedPnL += (openUsd - closeUsd);
+                } else {
+                    // default long
+                    realizedPnL += (closeUsd - openUsd);
+                }
+            }
+
+            return realizedPnL;
+        } catch (err) {
+            console.error('Error calculating realized PnL (positions pairing):', err);
+            // Fallback: previous naive method
+            let realizedPnL = 0;
+            const sellTrades = this.trades.filter(t => t.type === 'SELL');
+            for (const sell of sellTrades) {
+                const buyTrades = this.trades.filter(t => t.type === 'BUY' && new Date(t.timestamp) < new Date(sell.timestamp));
+                if (buyTrades.length > 0) {
+                    const avgBuyPrice = buyTrades.reduce((sum, trade) => sum + (trade.price * trade.amount), 0) / buyTrades.reduce((sum, trade) => sum + trade.amount, 0);
+                    realizedPnL += (sell.price - avgBuyPrice) * sell.amount;
+                }
+            }
+            return realizedPnL;
         }
-        
-        return realizedPnL;
     }
 
     // Calcular total de comisiones
@@ -1142,7 +1359,17 @@ class Portfolio {
     // Obtener precio actual de BTC (simulado)
     async getCurrentBtcPrice() {
         try {
-            // En un entorno real, esto vendría de la API
+            // Prefer an injected canonical marketData instance (set by the server)
+            // so that persistence and broadcasts use the same price.
+            if (this.marketData && typeof this.marketData.getCurrentPrice === 'function') {
+                const p = await this.marketData.getCurrentPrice();
+                // marketData.getCurrentPrice may return an object { price, ... }
+                if (p && typeof p === 'object' && typeof p.price !== 'undefined') return p.price;
+                // or a numeric value directly
+                if (typeof p === 'number') return p;
+            }
+
+            // Fallback: use local marketData module (for standalone/test contexts)
             const marketData = require('./marketData');
             const data = await marketData.getMarketData();
             return data.price;

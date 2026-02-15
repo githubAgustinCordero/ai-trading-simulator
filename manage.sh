@@ -10,7 +10,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Directorio del proyecto
-PROJECT_DIR="/var/www/agubot.ddns.net/ai-trading-simulator"
+PROJECT_DIR="/var/www/agubot.ddns.net/ai-trading-simulator-old-old"
 SERVICE_NAME="ai-trading-simulator"
 
 # Función para mostrar el estado

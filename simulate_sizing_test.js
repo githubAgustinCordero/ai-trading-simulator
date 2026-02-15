@@ -7,8 +7,9 @@
         const portfolio = new Portfolio();
         await portfolio.initialize();
 
-        // Monkeypatch db.getPortfolioState to return desired balance
-        portfolio.db.getPortfolioState = async () => ({ balance: balanceToUse, btc_amount: 0, initial_balance: 10000 });
+        // Monkeypatch db.getPortfolioState to return desired balance and a total_value
+        // so sizing uses total_value as the source of truth and then clamps to cash.
+        portfolio.db.getPortfolioState = async () => ({ balance: balanceToUse, btc_amount: 0, initial_balance: 10000, total_value: 10000 });
 
         // Stub executeTrade to capture the trade object without persisting
         let capturedTrade = null;
@@ -32,11 +33,11 @@
             await bot.openShort(50000, 80, ['Sim test']);
         }
 
-        // Expected
-        const expected = Number(balanceToUse) * 0.5;
+        // Expected: the bot uses total_value as target and clamps to available cash
+        const expected = Math.min(Number(10000), Number(balanceToUse));
 
         console.log('Balance provided:', balanceToUse);
-        console.log('Expected 50%:', expected.toFixed(8));
+        console.log('Expected (total_value clamped to cash):', expected.toFixed(8));
         if (capturedTrade) {
             console.log('Captured trade.usdAmount:', Number(capturedTrade.usdAmount).toFixed(8));
             const pass = Math.abs(Number(capturedTrade.usdAmount) - expected) < 0.0005;

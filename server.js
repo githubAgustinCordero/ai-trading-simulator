@@ -76,6 +76,43 @@ class AITradingServer {
                 // Posiciones abiertas y totales invertido/no invertido
                 const openPositions = this.portfolio.openPositions || [];
                 const priceNow = currentPrice?.price || 0;
+
+                // Sanitizar posiciones abiertas: normalizar números faltantes y filtrar entradas inválidas
+                const MIN_DISPLAY_USD = Number(process.env.MIN_DISPLAY_USD || 1);
+                const sanitizedOpenPositions = (openPositions || []).map(p => {
+                    const out = Object.assign({}, p);
+                    // Normalize entryPrice
+                    const rawEntryPrice = (typeof out.entryPrice !== 'undefined' && out.entryPrice !== null) ? Number(out.entryPrice) : 0;
+                    out.entryPrice = (rawEntryPrice && Number.isFinite(rawEntryPrice)) ? rawEntryPrice : Number(priceNow || 0);
+
+                    // Normalize amountBtc (derive from entryUsd if missing)
+                    let amt = (typeof out.amountBtc !== 'undefined' && out.amountBtc !== null) ? Number(out.amountBtc) : NaN;
+                    if (!amt || !Number.isFinite(amt) || amt <= 0) {
+                        const entryUsdCandidate = Number(out.entryUsd || out.usd_amount || 0) || 0;
+                        if (entryUsdCandidate > 0 && out.entryPrice > 0) {
+                            amt = entryUsdCandidate / out.entryPrice;
+                        } else {
+                            amt = 0;
+                        }
+                    }
+                    out.amountBtc = Number(amt) || 0;
+
+                    // Normalize entryUsd
+                    const rawEntryUsd = Number(out.entryUsd || out.usd_amount || 0) || 0;
+                    out.entryUsd = rawEntryUsd > 0 ? rawEntryUsd : (out.amountBtc > 0 ? Number(out.amountBtc * out.entryPrice) : 0);
+
+                    // Normalize timestamp to ISO string
+                    try {
+                        out.timestamp = out.timestamp ? new Date(out.timestamp).toISOString() : new Date().toISOString();
+                    } catch (e) { out.timestamp = new Date().toISOString(); }
+
+                    return out;
+                }).filter(p => {
+                    // Keep only positions that have a meaningful USD exposure or BTC amount
+                    const hasUsd = Number(p.entryUsd || 0);
+                    const hasAmt = Number(p.amountBtc || 0);
+                    return (hasUsd >= MIN_DISPLAY_USD) && (hasAmt > 0);
+                });
                 // Helper: obtener price de entrada preferente de la posición (entryPrice || trade.price si existe)
                 const getEntryPrice = (pos) => {
                     if (pos && pos.entryPrice) return Number(pos.entryPrice);
@@ -91,23 +128,35 @@ class AITradingServer {
                 };
 
                 // Base invertido (sin contar ganancias/perdidas): usar precio de entrada cuando esté disponible
-                const investedLongBaseUsd = openPositions
+                const investedLongBaseUsd = sanitizedOpenPositions
                     .filter(p => p.side === 'long')
                     .reduce((sum, p) => sum + (Number(p.amountBtc || 0) * getEntryPrice(p)), 0);
-                const investedShortBaseUsd = openPositions
+                const investedShortBaseUsd = sanitizedOpenPositions
                     .filter(p => p.side === 'short')
                     .reduce((sum, p) => sum + (Number(p.amountBtc || 0) * getEntryPrice(p)), 0);
                 const investedBaseUsd = investedLongBaseUsd + investedShortBaseUsd;
 
                 // PnL no realizado (suma de todas las posiciones) y PnL realizado
-                const unrealizedPnL = this.portfolio.getUnrealizedPnL(priceNow) || 0;
-                const realizedPnL = (portfolioStats && portfolioStats.realizedPnL) || 0;
+                let unrealizedPnL = this.portfolio.getUnrealizedPnL(priceNow) || 0;
+                let realizedPnL = (portfolioStats && (typeof portfolioStats.realizedPnL !== 'undefined' ? portfolioStats.realizedPnL : portfolioStats.realized_pnl)) || 0;
 
                 // Invertido incluyendo PnL: base + PnL no realizado
                 const investedWithPnl = investedBaseUsd + unrealizedPnL;
 
-                // Valor total según tu definición: capital inicial + PnL realizado + PnL no realizado
-                const totalValue = (this.portfolio.initialBalance || 0) + realizedPnL + unrealizedPnL;
+                // Valor total consistente: usar balance actual + PnL no realizado
+                // Evita duplicar ganancias cuando realizedPnL ya está reflejado en balance
+                let totalValue = Number(this.portfolio.balance || 0) + Number(unrealizedPnL || 0);
+                // PnL total (realizado + no realizado)
+                let totalPnl = (Number(realizedPnL || 0) + Number(unrealizedPnL || 0));
+
+                // Si estamos en el arranque/rebuild y NO hay historial de trades ni posiciones abiertas,
+                // evitar mostrar valores transitorios negativos: inicializar al initialBalance.
+                if ((!trades || trades.length === 0) && (!openPositions || openPositions.length === 0)) {
+                    totalValue = Number(this.portfolio.initialBalance || 0);
+                    unrealizedPnL = 0;
+                    realizedPnL = 0;
+                    totalPnl = 0;
+                }
 
                 // No invertido: inicial antes de abrir - dinero invertido (sin contar beneficio/pérdida)
                 let uninvestedUsd = (this.portfolio.initialBalance || 0) - investedBaseUsd;
@@ -129,6 +178,7 @@ class AITradingServer {
                         market: currentPrice,
                         bot: {
                             isActive: this.tradingBot.isActive,
+                            stochPeriod: (this.tradingBot && typeof this.tradingBot.getStochPeriod === 'function') ? this.tradingBot.getStochPeriod() : (this.tradingBot && this.tradingBot.stochPeriod) || '15m',
                             signals: botSignals,
                             strategy: this.tradingBot.getStrategy(),
                             ...botStats,
@@ -141,17 +191,25 @@ class AITradingServer {
                             profitFactor: (portfolioStats && typeof portfolioStats.profitFactor !== 'undefined') ? portfolioStats.profitFactor : (botStats && botStats.profitFactor) || null
                         },
                         positions: {
-                            open: openPositions,
+                            open: sanitizedOpenPositions,
                                 invested: {
                                     longUsd: investedLongBaseUsd,
                                     shortUsd: investedShortBaseUsd,
                                     totalUsd: investedBaseUsd,
                                     withPnl: investedWithPnl,
                                     uninvestedUsd: uninvestedUsd,
-                                    totalValue: totalValue
+                                    totalValue: investedWithPnl
                                 }
                         },
                         stats: portfolioStats,
+                        // Aclaraciones numéricas para evitar ambigüedades en la UI
+                        portfolioSummary: {
+                            initialBalance: Number(this.portfolio.initialBalance || 0),
+                            currentValue: Number(totalValue || 0),
+                            pnl: Number(totalPnl || 0),
+                            realizedPnL: Number(realizedPnL || 0),
+                            unrealizedPnL: Number(unrealizedPnL || 0)
+                        },
                         trades: trades,
                         // Métricas agregadas directas desde la BD para clarificar definiciones
                         metrics: tradeMetrics
@@ -189,6 +247,50 @@ class AITradingServer {
                     success: false,
                     message: error.message
                 });
+            }
+        });
+
+        // API: Obtener stop-loss en USD
+        this.app.get('/api/bot/stoploss', async (req, res) => {
+            try {
+                const cfg = await this.portfolio.db.getBotConfig();
+                const value = (cfg && (typeof cfg.stop_loss_usd !== 'undefined')) ? Number(cfg.stop_loss_usd) : 100;
+                res.json({ success: true, stopLossUsd: value });
+            } catch (err) {
+                console.error('Error obteniendo stoploss:', err);
+                res.status(500).json({ success: false, message: err.message });
+            }
+        });
+
+        // API: Actualizar stop-loss en USD
+        this.app.post('/api/bot/stoploss', async (req, res) => {
+            try {
+                const body = req.body || {};
+                const val = Number(body.stopLossUsd ?? body.value ?? body.stop_loss_usd);
+                if (!Number.isFinite(val) || val < 0) {
+                    return res.status(400).json({ success: false, message: 'stopLossUsd inválido' });
+                }
+
+                // Guardar en DB
+                await this.portfolio.db.runQuery('UPDATE bot_config SET stop_loss_usd = ? WHERE id = 1', [val]);
+
+                // Notify trading bot in memory if present
+                try {
+                    if (this.tradingBot) {
+                        this.tradingBot.stopLossUsd = Number(val);
+                        // also update settings for persistence in-memory
+                        this.tradingBot.settings = { ...(this.tradingBot.settings || {}), stopLossUsd: Number(val) };
+                    }
+                } catch (e) { console.warn('No se pudo actualizar stopLoss en memoria:', e); }
+
+                this.logActivity(`⚙️ Stop-loss actualizado a $${Number(val).toFixed(2)}`, 'info');
+                // Broadcast so UI updates
+                try { await this.broadcastUpdate(); } catch(e){}
+
+                res.json({ success: true, stopLossUsd: Number(val) });
+            } catch (err) {
+                console.error('Error guardando stoploss:', err);
+                res.status(500).json({ success: false, message: err.message });
             }
         });
 
@@ -244,6 +346,48 @@ class AITradingServer {
                     success: false,
                     message: error.message
                 });
+
+        // API: Obtener stoch period (5m/15m/30m)
+        this.app.get('/api/bot/stoch', async (req, res) => {
+            try {
+                const cfg = await this.portfolio.db.getBotConfig();
+                const value = (cfg && cfg.stoch_period) ? String(cfg.stoch_period) : ((this.tradingBot && typeof this.tradingBot.getStochPeriod === 'function') ? this.tradingBot.getStochPeriod() : '15m');
+                res.json({ success: true, stochPeriod: value });
+            } catch (err) {
+                console.error('Error obteniendo stochPeriod:', err);
+                res.status(500).json({ success: false, message: err.message });
+            }
+        });
+
+        // API: Actualizar stoch period
+        this.app.post('/api/bot/stoch', async (req, res) => {
+            try {
+                const body = req.body || {};
+                const val = String(body.period || body.stochPeriod || body.value || '').trim();
+                const allowed = ['5m', '15m', '30m'];
+                if (!allowed.includes(val)) {
+                    return res.status(400).json({ success: false, message: 'stoch period inválido. Use 5m, 15m o 30m' });
+                }
+
+                // Persist in DB
+                await this.portfolio.db.runQuery('UPDATE bot_config SET stoch_period = ? WHERE id = 1', [val]);
+
+                // Update in-memory tradingBot
+                try {
+                    if (this.tradingBot && typeof this.tradingBot.setStochPeriod === 'function') {
+                        this.tradingBot.setStochPeriod(val);
+                    }
+                } catch (e) { console.warn('Could not update tradingBot stochPeriod in-memory:', e && e.message ? e.message : e); }
+
+                // Broadcast update so UI reflects change
+                try { await this.broadcastUpdate(); } catch (e) {}
+
+                res.json({ success: true, stochPeriod: val });
+            } catch (err) {
+                console.error('Error guardando stochPeriod:', err);
+                res.status(500).json({ success: false, message: err.message });
+            }
+        });
             }
         });
 
@@ -405,7 +549,14 @@ class AITradingServer {
                             try {
                                 const entry = Number(ph.entryUsd || 0);
                                 const exitV = Number(ph.exitUsd || 0);
-                                ph.pnl = isFinite(exitV - entry) ? (exitV - entry) : null;
+                                const side = (ph.positionSide || (ph.openTrade && ph.openTrade.position_side) || 'long').toString().toLowerCase();
+                                if (side === 'short') {
+                                    // For shorts, profit is entry - exit (we received USD at open, paid USD at close)
+                                    ph.pnl = isFinite(entry - exitV) ? (entry - exitV) : null;
+                                } else {
+                                    // For longs, profit is exit - entry
+                                    ph.pnl = isFinite(exitV - entry) ? (exitV - entry) : null;
+                                }
                             } catch (e) { ph.pnl = null; }
                         }
                     });
@@ -619,7 +770,8 @@ class AITradingServer {
                         sma20: (mergedIndicators.sma20 && Array.isArray(mergedIndicators.sma20)) ? mergedIndicators.sma20[0] : (mergedIndicators.sma20 || 0),
                         sma50: (mergedIndicators.sma50 && Array.isArray(mergedIndicators.sma50)) ? mergedIndicators.sma50[0] : (mergedIndicators.sma50 || 0),
                         stoch: mergedIndicators.stoch || {},
-                        macd: (mergedIndicators.macd && Array.isArray(mergedIndicators.macd)) ? mergedIndicators.macd[0] : (mergedIndicators.macd || 0),
+                            stochPeriod: (this.tradingBot && typeof this.tradingBot.getStochPeriod === 'function') ? this.tradingBot.getStochPeriod() : (this.tradingBot && this.tradingBot.stochPeriod) || '15m',
+                            signals: signals,
                         bb_upper: (mergedIndicators.bb_upper && Array.isArray(mergedIndicators.bb_upper)) ? mergedIndicators.bb_upper[0] : (mergedIndicators.bb_upper || 0),
                         bb_lower: (mergedIndicators.bb_lower && Array.isArray(mergedIndicators.bb_lower)) ? mergedIndicators.bb_lower[0] : (mergedIndicators.bb_lower || 0),
                         volume: (mergedIndicators.volume && Array.isArray(mergedIndicators.volume)) ? mergedIndicators.volume[0] : (mergedIndicators.volume || 0)
@@ -720,7 +872,7 @@ class AITradingServer {
             const unrealizedPnL = this.portfolio.getUnrealizedPnL(priceNow) || 0;
             const realizedPnL = (portfolioStats && portfolioStats.realizedPnL) || 0;
             const investedWithPnl = investedBaseUsd + unrealizedPnL;
-            const totalValue = (this.portfolio.initialBalance || 0) + realizedPnL + unrealizedPnL;
+            const totalValue = Number(this.portfolio.balance || 0) + Number(unrealizedPnL || 0);
             let uninvestedUsd = (this.portfolio.initialBalance || 0) - investedBaseUsd;
             // Fallback to current balance if result is invalid (negative/NaN)
             if (typeof uninvestedUsd !== 'number' || isNaN(uninvestedUsd) || uninvestedUsd < 0) {
@@ -731,6 +883,20 @@ class AITradingServer {
                 type: 'update',
                 data: {
                     portfolio: portfolioStats,
+                    portfolioSummary: {
+                        initialBalance: Number(this.portfolio.initialBalance || 0),
+                        currentValue: Number(totalValue || 0),
+                        pnl: Number((realizedPnL || 0) + (unrealizedPnL || 0)),
+                        realizedPnL: Number(realizedPnL || 0),
+                        unrealizedPnL: Number(unrealizedPnL || 0)
+                    },
+                    portfolioSummary: {
+                        initialBalance: Number(this.portfolio.initialBalance || 0),
+                        currentValue: Number(totalValue || 0),
+                        pnl: Number((realizedPnL || 0) + (unrealizedPnL || 0)),
+                        realizedPnL: Number(realizedPnL || 0),
+                        unrealizedPnL: Number(unrealizedPnL || 0)
+                    },
                     market: currentPrice,
                     bot: {
                         isActive: this.tradingBot.isActive,
@@ -812,7 +978,7 @@ class AITradingServer {
             const unrealizedPnL = this.portfolio.getUnrealizedPnL(priceNow) || 0;
             const realizedPnL = (portfolioStats && portfolioStats.realizedPnL) || 0;
             const investedWithPnl = investedBaseUsd + unrealizedPnL;
-            const totalValue = (this.portfolio.initialBalance || 0) + realizedPnL + unrealizedPnL;
+            const totalValue = Number(this.portfolio.balance || 0) + Number(unrealizedPnL || 0);
             let uninvestedUsd = (this.portfolio.initialBalance || 0) - investedBaseUsd;
             if (typeof uninvestedUsd !== 'number' || isNaN(uninvestedUsd) || uninvestedUsd < 0) {
                 uninvestedUsd = Math.max(0, this.portfolio.balance || 0);
@@ -848,9 +1014,17 @@ class AITradingServer {
                 type: 'update',
                 data: {
                     portfolio: portfolioStats,
+                    portfolioSummary: {
+                        initialBalance: Number(this.portfolio.initialBalance || 0),
+                        currentValue: Number(totalValue || 0),
+                        pnl: Number((realizedPnL || 0) + (unrealizedPnL || 0)),
+                        realizedPnL: Number(realizedPnL || 0),
+                        unrealizedPnL: Number(unrealizedPnL || 0)
+                    },
                     market: currentPrice,
                     bot: {
                         isActive: this.tradingBot.isActive,
+                        stochPeriod: (this.tradingBot && typeof this.tradingBot.getStochPeriod === 'function') ? this.tradingBot.getStochPeriod() : (this.tradingBot && this.tradingBot.stochPeriod) || '15m',
                         signals: botSignals,
                         strategy: this.tradingBot.getStrategy(),
                         ...botStats,
@@ -878,6 +1052,11 @@ class AITradingServer {
                 }
             };
 
+            // DEBUG: log the authoritative payload sent to clients to help trace UI mismatches
+            try {
+                console.log('[DEBUG] broadcasting updateData.portfolioSummary=', JSON.stringify(updateData.data.portfolioSummary));
+                console.log('[DEBUG] broadcasting updateData.positions=', JSON.stringify(updateData.data.positions));
+            } catch (e) { /* ignore */ }
             this.broadcast(updateData);
             this.lastBroadcast = new Date();
         } catch (error) {
@@ -922,6 +1101,15 @@ class AITradingServer {
             console.log('🔄 Inicializando sistema de persistencia...');
             this.portfolio = new Portfolio(10000);
             const dbInitialized = await this.portfolio.initialize();
+            // Provide the portfolio with the canonical marketData instance
+            // so saved portfolio_state uses the same price the server broadcasts.
+            try {
+                if (typeof this.portfolio.setMarketData === 'function') {
+                    this.portfolio.setMarketData(this.marketData);
+                }
+            } catch (e) {
+                console.warn('⚠️ No se pudo inyectar marketData en portfolio:', e && e.message ? e.message : e);
+            }
             
             try {
                 if (this.portfolio && this.portfolio.db && this.portfolio.db.events) {
@@ -957,6 +1145,12 @@ class AITradingServer {
                 } else {
                     this.logActivity('ℹ️ No se encontró estrategia en DB, usando por defecto', 'info');
                 }
+                // Load stoch_period into tradingBot if present
+                try {
+                    if (botConfig && botConfig.stoch_period && this.tradingBot && typeof this.tradingBot.setStochPeriod === 'function') {
+                        this.tradingBot.setStochPeriod(String(botConfig.stoch_period));
+                    }
+                } catch (e) {}
 
                 // Si la configuración en BD indica que el bot debe estar activo, iniciarlo automáticamente
                 try {

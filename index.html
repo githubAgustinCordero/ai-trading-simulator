@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>AI Trading Simulator - Competencia $10,000</title>
     <style>
         :root {
@@ -91,7 +94,9 @@
 
         .controls {
             display: flex;
+            flex-wrap: wrap;
             justify-content: center;
+            align-items: center;
             gap: 15px;
             margin-bottom: 20px;
         }
@@ -473,29 +478,6 @@
             .dashboard {
                 grid-template-columns: repeat(2, 1fr);
             }
-
-            async forceSync() {
-                try {
-                    const response = await fetch('/api/bot/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
-                    const result = await response.json();
-                    if (result && result.success) {
-                        this.showAlert('Sincronización forzada: ' + (result.message || 'OK'), 'success');
-                        this.addLogEntry('Forzado rebuild ejecutado correctamente', 'success');
-                    } else {
-                        this.showAlert('Error forzando sincronización: ' + (result && result.message ? result.message : 'unknown'), 'error');
-                    }
-                } catch (err) {
-                    console.error('Error forzando sincronización:', err);
-                    this.showAlert('Error al forzar sincronización: ' + (err.message || err), 'error');
-                }
-
-                // Siempre intentar recargar datos del servidor después del rebuild
-                try {
-                    await this.fetchData();
-                } catch (err) {
-                    console.warn('fetchData fallo después de forceSync:', err);
-                }
-            }
         }
 
         @media (max-width: 900px) {
@@ -871,6 +853,15 @@
             color: rgba(255, 255, 255, 0.9);
         }
 
+        /* Force visibility of critical controls */
+        #stopLossInput, #setStopLossBtn, #stochSelector, #setStochBtn {
+            display: inline-block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            position: relative !important;
+            z-index: 1000 !important;
+        }
+
         @media (max-width: 768px) {
             .tooltip-text {
                 width: 250px;
@@ -965,6 +956,11 @@
                 <button id="stopBot" class="btn btn-stop">⏹️ Detener Bot</button>
                 <button id="resetBot" class="btn btn-reset">🔄 Reiniciar</button>
                     <button id="forceSyncBtn" class="btn-clear">🔁 Forzar Sync</button>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <label for="stopLossInput" style="color:var(--text-secondary); font-weight:600;">Stop-loss $</label>
+                    <input id="stopLossInput" type="number" step="1" min="0" value="100" style="width:110px; padding:8px; border-radius:8px; border:1px solid var(--border-color); background:transparent; color:var(--text-primary);">
+                    <button id="setStopLossBtn" class="btn-clear">💾 Guardar</button>
+                </div>
                 <button id="themeToggle" class="btn btn-theme">🌙 Modo Oscuro</button>
             </div>
         </header>
@@ -979,6 +975,15 @@
                     <div class="strategy-title">♾️ MAXI1 (Long / Short)</div>
                     <div class="strategy-description">Posición perpetua LONG o SHORT; cambia según Estocástico 15m (sin SL/TP)</div>
                 </div>
+            </div>
+            <div style="margin-top:12px; display:flex; justify-content:center; gap:10px; align-items:center;">
+                <label for="stochSelector" style="color:var(--text-secondary); font-weight:600;">Estocástico:</label>
+                <select id="stochSelector" style="padding:8px 10px; border-radius:8px; border:1px solid var(--border-color); background:transparent; color:var(--text-primary);">
+                    <option value="5m">5 minutos</option>
+                    <option value="15m">15 minutos</option>
+                    <option value="30m">30 minutos</option>
+                </select>
+                <button id="setStochBtn" class="btn-clear">💾 Guardar</button>
             </div>
         </div>
 
@@ -1376,7 +1381,7 @@
 
             async loadAllowedStrategies() {
                 try {
-                    const resp = await fetch('/api/bot/strategies');
+                    const resp = await fetch('/ai-trading-simulator-old/api/bot/strategies');
                     if (!resp.ok) throw new Error('No response');
                     const json = await resp.json();
                     if (json && json.success) {
@@ -1575,7 +1580,10 @@
 
             initializeWebSocket() {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//${window.location.host}`;
+                // Conectar al WebSocket usando la ruta del proyecto
+                const wsUrl = `${protocol}//${window.location.host}/ai-trading-simulator-old/`;
+                
+                console.log('🔌 Intentando conectar WebSocket a:', wsUrl);
                 
                 try {
                     this.ws = new WebSocket(wsUrl);
@@ -1626,15 +1634,16 @@
                     console.log('🔄 Processing update message');
 
                     // Validar datos antes de aceptarlos
+                    // Preferir la nueva estructura `portfolioSummary` que contiene: initialBalance, currentValue, pnl, realizedPnL, unrealizedPnL
                     const portfolio = data.data.portfolio || {};
+                    const portfolioSummary = data.data.portfolioSummary || {};
 
-                    // Algunos mensajes del servidor colocan las métricas principales en distintos campos
-                    // Aceptar totalValue desde portfolio o desde data.data.stats (compatibilidad)
-                    const totalValue = (typeof portfolio.totalValue === 'number') ? portfolio.totalValue : (data.data.stats && data.data.stats.totalValue) ? data.data.stats.totalValue : 0;
-                    const balance = (typeof portfolio.balance === 'number') ? portfolio.balance : (data.data.stats && typeof data.data.stats.balance === 'number') ? data.data.stats.balance : 0;
+                    // Compatibilidad: aceptar currentValue desde portfolioSummary, o totalValue desde portfolio/stats
+                    const totalValue = (typeof portfolioSummary.currentValue === 'number') ? portfolioSummary.currentValue : ((typeof portfolio.totalValue === 'number') ? portfolio.totalValue : (data.data.stats && data.data.stats.totalValue ? data.data.stats.totalValue : 0));
+                    const balance = (typeof portfolio.balance === 'number') ? portfolio.balance : (data.data.stats && typeof data.data.stats.balance === 'number' ? data.data.stats.balance : 0);
 
                     // Validación relajada: considerar válido si el valor total del portafolio es razonable
-                    const isValidData = (typeof totalValue === 'number' && totalValue >= 1000);
+                    const isValidData = (typeof totalValue === 'number' && totalValue >= 1000) || (typeof portfolioSummary.initialBalance === 'number');
 
                     if (!isValidData) {
                         console.error('🚨 WebSocket recibió datos INVÁLIDOS (rejected):', {
@@ -1642,6 +1651,7 @@
                             balance: balance,
                             btcAmount: portfolio.btcAmount,
                             currentBtcPrice: data.data.market?.price,
+                            portfolioSummary: portfolioSummary,
                             fullPortfolio: portfolio,
                             timestamp: new Date().toISOString()
                         });
@@ -1720,6 +1730,89 @@
                         this.selectStrategy(strategy);
                     });
                 });
+
+                // Stop-loss control
+                const stopBtn = document.getElementById('setStopLossBtn');
+                const stopInput = document.getElementById('stopLossInput');
+                if (stopBtn && stopInput) {
+                    stopBtn.addEventListener('click', async () => {
+                        const v = Number(stopInput.value);
+                        if (!Number.isFinite(v) || v < 0) {
+                            this.showAlert('Stop-loss inválido', 'error');
+                            return;
+                        }
+                        try {
+                            const resp = await fetch('/ai-trading-simulator-old/api/bot/stoploss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stopLossUsd: v }) });
+                            const j = await resp.json();
+                            if (j && j.success) {
+                                this.showAlert(`Stop-loss actualizado a $${Number(v).toFixed(2)}`, 'success');
+                            } else {
+                                this.showAlert('Error actualizando stop-loss: ' + (j && j.message ? j.message : 'unknown'), 'error');
+                            }
+                        } catch (err) {
+                            console.error('Error guardando stop-loss:', err);
+                            this.showAlert('Error guardando stop-loss: ' + (err.message || err), 'error');
+                        }
+                    });
+
+                    // Load current value initially
+                    try { this.fetchStopLoss(); } catch(e){}
+                }
+
+                // Stochastic selector control
+                const stochSelector = document.getElementById('stochSelector');
+                const setStochBtn = document.getElementById('setStochBtn');
+                if (stochSelector) {
+                    // Load current value
+                    try { this.fetchStochPeriod(); } catch(e){}
+                    stochSelector.addEventListener('change', (e) => {
+                        // enable save button when changed
+                        if (setStochBtn) setStochBtn.disabled = false;
+                    });
+                }
+                if (setStochBtn && stochSelector) {
+                    setStochBtn.addEventListener('click', async () => {
+                        const val = stochSelector.value;
+                        try {
+                            const resp = await fetch('/ai-trading-simulator-old/api/bot/stoch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ period: val }) });
+                            const j = await resp.json();
+                            if (j && j.success) {
+                                this.showAlert('Estocástico actualizado a ' + val, 'success');
+                                if (setStochBtn) setStochBtn.disabled = true;
+                                // refresh data
+                                try { await this.fetchData(); } catch(e){}
+                            } else {
+                                this.showAlert('Error guardando estocástico: ' + (j && j.message ? j.message : 'unknown'), 'error');
+                            }
+                        } catch (err) {
+                            console.error('Error guardando estocástico:', err);
+                            this.showAlert('Error guardando estocástico: ' + (err.message || err), 'error');
+                        }
+                    });
+                }
+            }
+
+            async forceSync() {
+                try {
+                    const response = await fetch('/ai-trading-simulator-old/api/bot/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                    const result = await response.json();
+                    if (result && result.success) {
+                        this.showAlert('Sincronización forzada: ' + (result.message || 'OK'), 'success');
+                        this.addLogEntry('Forzado rebuild ejecutado correctamente', 'success');
+                    } else {
+                        this.showAlert('Error forzando sincronización: ' + (result && result.message ? result.message : 'unknown'), 'error');
+                    }
+                } catch (err) {
+                    console.error('Error forzando sincronización:', err);
+                    this.showAlert('Error al forzar sincronización: ' + (err.message || err), 'error');
+                }
+
+                // Siempre intentar recargar datos del servidor después del rebuild
+                try {
+                    await this.fetchData();
+                } catch (err) {
+                    console.warn('fetchData fallo después de forceSync:', err);
+                }
             }
 
             setupChartToggle() {
@@ -1780,7 +1873,7 @@
                         return;
                     }
 
-                    const response = await fetch('/api/bot/strategy', {
+                    const response = await fetch('/ai-trading-simulator-old/api/bot/strategy', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -1858,7 +1951,7 @@
             async loadCompleteHistory() {
                 try {
                     // Obtener historial completo desde el servidor
-                    const response = await fetch('/api/history');
+                    const response = await fetch('/ai-trading-simulator-old/api/history');
                     if (!response.ok) {
                         throw new Error(`Error del servidor: ${response.status}`);
                     }
@@ -1907,7 +2000,7 @@
 
             async controlBot(action) {
                 try {
-                    const response = await fetch(`/api/bot/${action}`, {
+                    const response = await fetch(`/ai-trading-simulator-old/api/bot/${action}`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -1942,21 +2035,25 @@
 
             async fetchData() {
                 try {
-                    const response = await fetch('/api/status');
+                    const response = await fetch('/ai-trading-simulator-old/api/status');
                     const data = await response.json();
                     
                     if (data.success) {
                         // Validación relajada: aceptar actualizaciones cuando el totalValue es razonable
-                        // Nota: en SIMPLE MODE el backend puede reportar balance=0 temporalmente,
-                        // por eso no exigimos balance >= 1000 aquí.
+                        // Preferir `portfolioSummary.currentValue` si el backend lo provee
                         const portfolio = data.data.portfolio || {};
-                        const isValidData = (typeof portfolio.totalValue === 'number' && portfolio.totalValue >= 1000);
+                        const portfolioSummary = data.data.portfolioSummary || {};
+                        const totalValue = (typeof portfolioSummary.currentValue === 'number') ? portfolioSummary.currentValue : ((typeof portfolio.totalValue === 'number') ? portfolio.totalValue : (data.data.stats && data.data.stats.totalValue ? data.data.stats.totalValue : 0));
+
+                        // Nota: en SIMPLE MODE el backend puede reportar balance=0 temporalmente,
+                        // por eso no exigimos balance >= 1000 aquí si el backend envía initialBalance.
+                        const isValidData = (typeof totalValue === 'number' && totalValue >= 1000) || (typeof portfolioSummary.initialBalance === 'number');
                         if (!isValidData) {
                             // Si no hay un totalValue razonable, aceptamos la respuesta sólo si
                             // el backend incluye posiciones abiertas explícitas (fallback).
                             const hasPositions = Array.isArray(data.data.positions && data.data.positions.open) && data.data.positions.open.length > 0;
                             if (!hasPositions) {
-                                console.error('🚨 fetchData recibió datos INVÁLIDOS y sin posiciones abiertas:', { totalValue: portfolio.totalValue, balance: portfolio.balance });
+                                console.error('🚨 fetchData recibió datos INVÁLIDOS y sin posiciones abiertas:', { totalValue: totalValue, balance: portfolio.balance, portfolioSummary: portfolioSummary });
                                 return; // No actualizar con datos inválidos y sin posiciones
                             }
                         }
@@ -1977,6 +2074,38 @@
                     }
                 } catch (error) {
                     console.error('Error fetching data:', error);
+                }
+            }
+
+            async fetchStopLoss() {
+                try {
+                    const resp = await fetch('/ai-trading-simulator-old/api/bot/stoploss');
+                    if (!resp.ok) return;
+                    const j = await resp.json();
+                    if (j && j.success && typeof j.stopLossUsd !== 'undefined') {
+                        const inp = document.getElementById('stopLossInput');
+                        if (inp) inp.value = Number(j.stopLossUsd);
+                    }
+                } catch (e) {
+                    console.warn('No se pudo obtener stop-loss desde servidor:', e && e.message ? e.message : e);
+                }
+            }
+
+            async fetchStochPeriod() {
+                try {
+                    const resp = await fetch('/ai-trading-simulator-old/api/bot/stoch');
+                    if (!resp.ok) return;
+                    const j = await resp.json();
+                    if (j && j.success && j.stochPeriod) {
+                        const sel = document.getElementById('stochSelector');
+                        if (sel) {
+                            sel.value = j.stochPeriod;
+                            const setBtn = document.getElementById('setStochBtn');
+                            if (setBtn) setBtn.disabled = true;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('No se pudo obtener stochPeriod desde servidor:', e && e.message ? e.message : e);
                 }
             }
 
@@ -2003,16 +2132,12 @@
                 const signals = bot.signals || {};
                 const indicators = signals.indicators || {};
                 const stoch = indicators.stoch || {};
-                const st15m = stoch['15m'] || {};
+                const period = (this.data.bot && this.data.bot.stochPeriod) ? this.data.bot.stochPeriod : '15m';
+                const stPeriod = stoch[period] || {};
 
-                console.log('📊 Datos estocásticos:', {
-                    stoch: stoch,
-                    st15m: st15m,
-                    k: st15m.k,
-                    d: st15m.d
-                });
+                console.log('📊 Datos estocásticos:', { stoch: stoch, period: period, stPeriod: stPeriod, k: stPeriod.k, d: stPeriod.d });
 
-                if (st15m.k !== null && st15m.d !== null) {
+                if (typeof stPeriod.k === 'number' && typeof stPeriod.d === 'number') {
                     console.log('✅ Datos válidos, actualizando gráfico');
 
                     // Obtener timestamp actual
@@ -2021,8 +2146,8 @@
 
                     // Agregar datos al historial
                     this.stochHistory.timestamps.push(timeStr);
-                    this.stochHistory.k15m.push(st15m.k);
-                    this.stochHistory.d15m.push(st15m.d);
+                    this.stochHistory.k15m.push(stPeriod.k);
+                    this.stochHistory.d15m.push(stPeriod.d);
 
                     // Mantener solo los últimos N puntos
                     if (this.stochHistory.timestamps.length > this.maxHistoryPoints) {
@@ -2041,6 +2166,9 @@
                     this.stochChart15m.data.labels = this.stochHistory.timestamps;
                     this.stochChart15m.data.datasets[0].data = this.stochHistory.k15m;
                     this.stochChart15m.data.datasets[1].data = this.stochHistory.d15m;
+                    // Update labels to indicate the timeframe
+                    this.stochChart15m.data.datasets[0].label = `K (${period})`;
+                    this.stochChart15m.data.datasets[1].label = `D (${period})`;
                     this.stochChart15m.update('none'); // 'none' = sin animación para que sea más fluido
 
                     console.log('✅ Gráfico actualizado');
@@ -2073,58 +2201,80 @@
 
             updatePortfolio() {
                 const portfolio = this.data.portfolio || {};
+                const portfolioSummary = this.data.portfolioSummary || {};
                 const positions = this.data.positions || {};
                 const invested = positions.invested || {};
-                
+
+                // Deterministic display: prefer authoritative definition
+                // 1) If backend provides portfolioSummary.currentValue use it
+                // 2) Else, if we have balance + unrealizedPnL compute totalValue (most reliable)
+                // 3) Else fall back to portfolio.totalValue (legacy)
+                // 4) Finally default to initial 10000
+                let displayValue;
+                if (typeof portfolioSummary.currentValue === 'number') {
+                    displayValue = portfolioSummary.currentValue;
+                } else if (typeof portfolio.balance === 'number' && typeof portfolioSummary.unrealizedPnL === 'number') {
+                    displayValue = Number(portfolio.balance) + Number(portfolioSummary.unrealizedPnL);
+                } else if (typeof portfolio.totalValue === 'number') {
+                    displayValue = portfolio.totalValue;
+                } else if (positions && positions.invested && typeof positions.invested.totalValue === 'number') {
+                    // fallback: some broadcasts populated positions.invested.totalValue
+                    displayValue = positions.invested.totalValue;
+                } else {
+                    displayValue = 10000;
+                }
+
                 const totalValueEl = document.getElementById('totalValue');
                 if (totalValueEl) {
-                    let displayValue = (typeof portfolio.totalValue === 'number') ? portfolio.totalValue : 10000;
-                    
-                    // Validación: si el valor es irrazonablemente bajo, usar el balance como fallback
-                    if (displayValue < 1000 && portfolio.balance >= 1000) {
-                        console.warn('⚠️ totalValue seems incorrect, using balance as fallback:', displayValue, '->', portfolio.balance);
-                        displayValue = portfolio.balance;
-                    }
-                    
-                    totalValueEl.textContent = 
-                        `$${(displayValue).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    totalValueEl.textContent = `$${(displayValue).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
                 }
-                
+
                 // Invertido / No invertido
                 const investedTotalEl = document.getElementById('investedTotal');
                 const uninvestedTotalEl = document.getElementById('uninvestedTotal');
-                if (investedTotalEl) investedTotalEl.textContent = `$${(invested.totalUsd || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                if (uninvestedTotalEl) {
-                    // Preferir explícitamente el valor enviado por el backend si es un número válido
-                    let uninvestedValue;
-                    if (invested && typeof invested.uninvestedUsd === 'number' && !isNaN(invested.uninvestedUsd)) {
-                        uninvestedValue = invested.uninvestedUsd;
-                        console.debug('UI: usando invested.uninvestedUsd:', uninvestedValue);
-                    } else {
-                        uninvestedValue = (typeof portfolio.balance === 'number' && !isNaN(portfolio.balance)) ? portfolio.balance : 10000;
-                        console.debug('UI: usando fallback portfolio.balance:', uninvestedValue, 'invested.uninvestedUsd=', invested ? invested.uninvestedUsd : undefined);
-                    }
 
-                    // Validación: si el valor no invertido es irrazonablemente bajo, usar el balance
-                    if (uninvestedValue < 1000 && portfolio.balance >= 1000) {
-                        console.warn('⚠️ uninvestedUsd parece incorrecto, usando balance como fallback:', uninvestedValue, '->', portfolio.balance);
-                        uninvestedValue = portfolio.balance;
-                    }
+                // Invested: preferir valores explícitos del backend (positions.invested)
+                const investedUsd = (typeof invested.totalUsd === 'number') ? invested.totalUsd : ((typeof invested.totalValue === 'number') ? invested.totalValue : 0);
+                if (investedTotalEl) investedTotalEl.textContent = `$${Number(investedUsd || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
 
-                    uninvestedTotalEl.textContent = `$${(uninvestedValue).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                // Uninvested: preferir invested.uninvestedUsd, luego portfolio.balance, finalmente derive como displayValue - investedUsd
+                let uninvestedValue = null;
+                if (invested && typeof invested.uninvestedUsd === 'number' && !isNaN(invested.uninvestedUsd)) {
+                    uninvestedValue = invested.uninvestedUsd;
+                } else if (typeof portfolio.balance === 'number' && !isNaN(portfolio.balance)) {
+                    uninvestedValue = portfolio.balance;
+                } else if (typeof portfolioSummary.unrealizedPnL === 'number' && typeof portfolioSummary.realizedPnL === 'number' && typeof portfolioSummary.initialBalance === 'number') {
+                    // Try to compute an approximate 'cash' as initialBalance + realizedPnL - investedUsd (best-effort)
+                    uninvestedValue = Math.max(0, (portfolioSummary.initialBalance + portfolioSummary.realizedPnL) - investedUsd);
+                } else {
+                    uninvestedValue = Math.max(0, displayValue - investedUsd);
                 }
-                
-                const totalReturn = portfolio.totalReturn || 0;
+
+                if (uninvestedTotalEl) uninvestedTotalEl.textContent = `$${Number(uninvestedValue || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+
+                // Rendimiento: preferir portfolioSummary.pnl y portfolioSummary.initialBalance
+                let totalReturn = null;
+                if (typeof portfolioSummary.pnl === 'number' && typeof portfolioSummary.initialBalance === 'number' && portfolioSummary.initialBalance !== 0) {
+                    totalReturn = (portfolioSummary.pnl / portfolioSummary.initialBalance) * 100;
+                } else if (typeof portfolio.totalReturn === 'number') {
+                    totalReturn = portfolio.totalReturn;
+                } else {
+                    // Fallback: compute from displayValue assuming initial 10k
+                    const initial = (typeof portfolioSummary.initialBalance === 'number') ? portfolioSummary.initialBalance : 10000;
+                    totalReturn = ((displayValue - initial) / initial) * 100;
+                }
+
                 const returnElement = document.getElementById('totalReturn');
                 if (returnElement) {
-                    returnElement.textContent = `${totalReturn.toFixed(2)}%`;
-                    returnElement.className = `metric-value ${totalReturn >= 0 ? 'positive' : 'negative'}`;
+                    const rt = Number(totalReturn || 0);
+                    returnElement.textContent = `${rt.toFixed(2)}%`;
+                    returnElement.className = `metric-value ${rt >= 0 ? 'positive' : 'negative'}`;
                 }
-                
+
                 // Actualizar barra de progreso
                 const returnProgressEl = document.getElementById('returnProgress');
                 if (returnProgressEl) {
-                    const progress = Math.max(0, Math.min(100, 50 + (totalReturn * 2)));
+                    const progress = Math.max(0, Math.min(100, 50 + (Number(totalReturn || 0) * 2)));
                     returnProgressEl.style.width = `${progress}%`;
                 }
             }
@@ -2737,10 +2887,38 @@
             }
         }
 
+        // Helper: ensure core UI elements are visible and log their presence
+        function ensureUiElementsVisible() {
+            const ids = ['startBot','stopBot','resetBot','forceSyncBtn','stopLossInput','setStopLossBtn','stochSelector','setStochBtn'];
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    try {
+                        el.style.display = el.style.display || 'inline-block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = '1';
+                        el.style.position = el.style.position || 'relative';
+                        el.style.zIndex = '999';
+                        console.log('UI check: element present and forced visible ->', id);
+                    } catch (e) {
+                        console.warn('UI check: could not modify element', id, e);
+                    }
+                } else {
+                    console.warn('UI check: element MISSING ->', id);
+                }
+            });
+        }
+
         // Inicializar dashboard cuando la página se carga
         document.addEventListener('DOMContentLoaded', () => {
             loadSavedTheme();
+            // First pass: ensure elements exist in DOM and are visible
+            try { ensureUiElementsVisible(); } catch(e) { console.warn('ensureUiElementsVisible failed', e); }
             window.dashboard = new TradingDashboard();
+            // Second pass after a short delay in case other scripts modify the DOM
+            setTimeout(() => {
+                try { ensureUiElementsVisible(); } catch(e) { console.warn('ensureUiElementsVisible delayed failed', e); }
+            }, 1200);
         });
     </script>
 </body>

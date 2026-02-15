@@ -2,7 +2,7 @@
 
 echo "🚀 Activando bot de trading en modo automático..."
 
-cd /var/www/agubot.ddns.net/ai-trading-simulator
+cd /var/www/agubot.ddns.net/ai-trading-simulator-old-old
 
 # Iniciar servidor en background
 echo "📡 Iniciando servidor..."

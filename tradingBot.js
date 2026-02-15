@@ -10,6 +10,10 @@ class TradingBot {
             cooldownPeriod: 300000, // not used by MAXI1 but left for compatibility
             minConfidence: 40
         };
+        // Which stochastic timeframe the strategy should prefer: '5m','15m','30m'
+        this.stochPeriod = '15m';
+        // Stop loss in USD (default $100)
+        this.stopLossUsd = 100;
         this.currentPosition = null; // { side, amountBtc, entryPrice }
         this.isStopping = false;
     }
@@ -34,6 +38,18 @@ class TradingBot {
             if (this.portfolio) this.portfolio.simpleMode = true;
 
             await this.syncCurrentPosition();
+            // Load bot-config stop loss USD if available
+            try {
+                if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getBotConfig === 'function') {
+                    const bc = await this.portfolio.db.getBotConfig();
+                    if (bc && typeof bc.stop_loss_usd !== 'undefined' && Number.isFinite(Number(bc.stop_loss_usd))) {
+                        this.stopLossUsd = Number(bc.stop_loss_usd);
+                        console.log(`⚙️ Stop-loss USD cargado desde DB: $${this.stopLossUsd}`);
+                    }
+                }
+            } catch (e) {
+                console.warn('No se pudo cargar stop_loss_usd desde DB:', e && e.message ? e.message : e);
+            }
             // Open initial position according to current signal
             await this.openInitialPosition();
         } catch (err) {
@@ -84,6 +100,13 @@ class TradingBot {
         const marketData = await this.marketData.getCurrentPrice();
         if (!marketData) return;
 
+        // First, check active position for stop-loss breach
+        try {
+            await this.checkPositions(marketData.price);
+        } catch (e) {
+            console.warn('Error comprobando stop-loss en checkPositions:', e && e.message ? e.message : e);
+        }
+
         let signals = null;
         try {
             signals = this.marketData.getMarketSignals();
@@ -124,8 +147,9 @@ class TradingBot {
             const confidence = Number(signals.confidence || 100);
             if (signal === 'BUY') return await this.ensureFullPosition('long', market.price, confidence, signals);
             if (signal === 'SELL') return await this.ensureFullPosition('short', market.price, confidence, signals);
-            const st15 = signals.indicators?.stoch?.['15m'] || {};
-            if (typeof st15.k === 'number' && st15.k < 50) return await this.ensureFullPosition('long', market.price, confidence, signals);
+            const stKey = this.stochPeriod || '15m';
+            const st = signals.indicators?.stoch?.[stKey] || {};
+            if (typeof st.k === 'number' && st.k < 50) return await this.ensureFullPosition('long', market.price, confidence, signals);
             return await this.ensureFullPosition('short', market.price, confidence, signals);
         } catch (e) {
             console.error('Error opening initial position:', e && e.message ? e.message : e);
@@ -318,6 +342,14 @@ class TradingBot {
                     try { inMemoryTotalForDebug = Number(this.portfolio.getTotalValue(price)); } catch(e) { inMemoryTotalForDebug = null; }
                     try { console.log(`🛰️ totalValueAfterClose (db)=${totalValueAfterClose}, totalValueAfterClose(inMemory)=${inMemoryTotalForDebug !== null ? '$'+inMemoryTotalForDebug.toFixed(2) : 'N/A'}`); } catch(e){}
 
+
+                // Load stoch_period from DB if present
+                try {
+                    if (botConfig && botConfig.stoch_period) {
+                        this.stochPeriod = String(botConfig.stoch_period);
+                        console.log(`⚙️ Stochastic timeframe cargado desde DB: ${this.stochPeriod}`);
+                    }
+                } catch (e) {}
             // If DB reports zero/negative total_value (likely due to DB snapshot), prefer a healthy in-memory total when available
             if ((totalValueAfterClose === null || totalValueAfterClose <= 0) && inMemoryTotalForDebug && inMemoryTotalForDebug > 0) {
                 console.log(`⚠️ DB total_value is ${totalValueAfterClose}; falling back to in-memory total_value $${inMemoryTotalForDebug.toFixed(2)} for sizing`);
@@ -570,8 +602,58 @@ class TradingBot {
 
     // Basic position checks - MAXI1 doesn't use SL/TP but keep a simple logger
     async checkPositions(currentPrice) {
-        if (!this.currentPosition) return;
-        console.log(`🔍 [CHECK] Manteniendo ${this.currentPosition.side} - entry ${this.currentPosition.entryPrice}`);
+        try {
+            if (!this.currentPosition) return;
+            const side = this.currentPosition.side;
+            const entry = Number(this.currentPosition.entryPrice || 0);
+            const amt = Number(this.currentPosition.amountBtc || 0);
+            if (!entry || !amt || !Number.isFinite(currentPrice)) return;
+
+            // Ensure we have latest stopLossUsd (try DB first)
+            try {
+                if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.getBotConfig === 'function') {
+                    const bc = await this.portfolio.db.getBotConfig();
+                    if (bc && typeof bc.stop_loss_usd !== 'undefined' && Number.isFinite(Number(bc.stop_loss_usd))) {
+                        this.stopLossUsd = Number(bc.stop_loss_usd);
+                    }
+                }
+            } catch (e) {
+                // ignore
+            }
+
+            const stopUsd = Number(this.stopLossUsd || 0);
+            if (!stopUsd || stopUsd <= 0) return;
+
+            let lossUsd = 0;
+            if (side === 'long') {
+                // loss when price drops below entry
+                if (currentPrice >= entry) return;
+                lossUsd = (entry - currentPrice) * amt;
+            } else if (side === 'short') {
+                // loss when price rises above entry
+                if (currentPrice <= entry) return;
+                lossUsd = (currentPrice - entry) * amt;
+            }
+
+            if (lossUsd >= stopUsd) {
+                console.log(`🚨 STOP-LOSS triggered for ${side} position: loss=$${lossUsd.toFixed(2)} >= stopUsd=$${stopUsd.toFixed(2)} — switching position`);
+                try {
+                    // log to DB
+                    if (this.portfolio && this.portfolio.db && typeof this.portfolio.db.addLog === 'function') {
+                        await this.portfolio.db.addLog('warning', `Stop-loss triggered: ${side} loss $${lossUsd.toFixed(2)} >= $${stopUsd.toFixed(2)}`, 'tradingBot', { side, entry, currentPrice, amountBtc: amt, lossUsd, stopUsd });
+                    }
+                } catch (e) {}
+
+                const target = side === 'long' ? 'short' : 'long';
+                try {
+                    await this.switchPosition(target, currentPrice, 90, ['STOP_LOSS_TRIGGERED']);
+                } catch (e) {
+                    console.error('Error switching position after stop-loss:', e && e.message ? e.message : e);
+                }
+            }
+        } catch (err) {
+            console.error('Error en checkPositions:', err);
+        }
     }
 
     // Synchronize currentPosition from portfolio.openPositions
@@ -750,11 +832,27 @@ class TradingBot {
             lastTradeTime: this.lastTradeTime
         };
     }
-
     updateSettings(newSettings) {
         this.settings = { ...this.settings, ...newSettings };
+        // Allow updating stochPeriod via settings
+        if (newSettings && newSettings.stochPeriod) {
+            this.stochPeriod = String(newSettings.stochPeriod);
+            console.log(`⚙️ Updated stochPeriod via settings: ${this.stochPeriod}`);
+        }
         console.log('⚙️ Configuración actualizada:', this.settings);
         return true;
+    }
+
+    setStochPeriod(period) {
+        if (!period) return false;
+        this.stochPeriod = String(period);
+        this.settings = { ...this.settings, stochPeriod: this.stochPeriod };
+        console.log(`⚙️ Stochastic timeframe establecido: ${this.stochPeriod}`);
+        return true;
+    }
+
+    getStochPeriod() {
+        return this.stochPeriod || '15m';
     }
 }
 
